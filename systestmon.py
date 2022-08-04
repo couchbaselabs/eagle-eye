@@ -52,7 +52,7 @@ class SysTestMon():
                          "Failed to initialize metadata provider", "found missing page", "invalid last page",
                          "Storage corrupted and unrecoverable", "ensureMonotonicTs  Align seqno smaller than lastFlushTs", 
                          "TS falls out of snapshot boundary", "invalid length of composite element filters in scan request",
-                         "Internal error while creating new scan request"],
+                         "Internal error while creating new scan request", "StorageMgr::handleCreateSnapshot Disk commit timestamp is not snapshot aligned"],
             "ignore_keywords": ["fatal remote"],
             "check_stats_api": True,
             "stats_api_list": ["stats/storage", "stats"],
