@@ -478,8 +478,8 @@ class SysTestMon():
             self.update_state_file()
 
             self.logger.info(
-                "====== Log scan iteration number {1} complete. Sleeping for {0} seconds ======".format(
-                    self.scan_interval, iter_count))
+                "====== Log scan iteration number {0} complete"
+                "======".format(iter_count))
             message_sub = message_sub.join(
                 "Node: {0} : Log scan iteration number {1} complete".format(master_node, iter_count))
             if should_cbcollect:
@@ -492,7 +492,13 @@ class SysTestMon():
 
             if not self.run_infinite:
                 break
-            time.sleep(self.scan_interval)
+            if time.time() - start_time >= self.scan_interval:
+                continue
+            else:
+                sleep_time = self.scan_interval - int(time.time() - start_time)
+                self.logger.info(
+                    "====== Sleeping for {0} seconds ======".format(sleep_time))
+                time.sleep(sleep_time)
 
     def get_ssh_client(self, host, username, password):
         client = paramiko.SSHClient()
