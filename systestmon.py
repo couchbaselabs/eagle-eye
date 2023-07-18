@@ -50,7 +50,7 @@ class SysTestMon():
             "keywords": ["panic", "fatal", "Error parsing XATTR", "zero", "protobuf.Error", "Encounter planner error",
                          "corruption", "processFlushAbort", "Basic\s[a-zA-Z]\{10,\}", "Menelaus-Auth-User:\[",
                          "Failed to initialize metadata provider", "found missing page", "invalid last page",
-                         "Storage corrupted and unrecoverable", "ensureMonotonicTs  Align seqno smaller than lastFlushTs", 
+                         "Storage corrupted and unrecoverable", "ensureMonotonicTs  Align seqno smaller than lastFlushTs",
                          "TS falls out of snapshot boundary", "invalid length of composite element filters in scan request",
                          "Internal error while creating new scan request", "StorageMgr::handleCreateSnapshot Disk commit timestamp is not snapshot aligned"],
             "ignore_keywords": ["fatal remote"],
@@ -64,7 +64,7 @@ class SysTestMon():
             "logfiles": "analytics_error*",
             "services": "cbas",
             "keywords": ["fata", "Analytics Service is temporarily unavailable", "Failed during startup task", "HYR0",
-                         "ASX", "IllegalStateException", "Basic\s[a-zA-Z]\{10,\}", "Menelaus-Auth-User:\[", "panic", "ResourceLeakDetector.*LEAK",
+                         "ASX", "IllegalStateException", "Basic\s[a-zA-Z]\{10,\}", "Menelaus-Auth-User:\[", "panic", "LEAK: ByteBuf.release() was not called",
                          "failed to migrate metadata partition"],
             "ignore_keywords": ["HYR0010","HYR0115","ASX3110","HYR0114"],
             "check_stats_api": False,
@@ -1104,7 +1104,7 @@ if __name__ == '__main__':
     should_collect_dumps = sys.argv[12]
     docker_host = sys.argv[13]
     try:
-        cb_host = sys.argv[14] 
+        cb_host = sys.argv[14]
     except IndexError:
         cb_host = "172.23.104.178"
     SysTestMon().run(master_node, rest_username, rest_password, ssh_username, ssh_password,
