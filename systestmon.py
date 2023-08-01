@@ -1,8 +1,7 @@
-import copy
+import argparse
 import json
 import logging
 import re
-import sys
 from datetime import datetime, timedelta
 import httplib2
 import traceback
@@ -15,20 +14,68 @@ import zipfile
 from couchbase.cluster import Cluster, PasswordAuthenticator
 
 import paramiko
-import requests
 from collections import Mapping, Sequence, Set, deque
 
 from scp import SCPClient
 
 
-class SysTestMon():
+class Globals(object):
+    logger = logging.getLogger("systestmon")
+    timestamp = str(datetime.now().strftime('%Y-%m-%dT%H:%M:%S'))
+    sdk_client = None
+
+
+class SDKClient(object):
+    def __init__(self, cb_host):
+        try:
+            self.cluster = self.get_cluster(cb_host)
+            self.bucket = self.get_bucket("system_test_dashboard")
+        except Exception as e:
+            print("SDK WARNING: %s" % e)
+
+    def append_list(self, key, value):
+        try:
+            self.bucket.list_append(key, value, create=True)
+        except Exception:
+            self.bucket.default_collection().list_append(key, value, create=True)
+
+    def store_results(self, msg_sub, msg_content):
+        build_id = os.getenv("BUILD_NUMBER")
+        if build_id is not None:
+            key = "log_parser_results_" + build_id
+            self.append_list(key, msg_sub + "\n" + msg_content)
+
+    def get_cluster(self, cb_host):
+        try:
+            cluster = Cluster('couchbase://{}'.format(cb_host))
+            authenticator = PasswordAuthenticator('Administrator', 'password')
+            cluster.authenticate(authenticator)
+            return cluster
+        except Exception:
+            from couchbase.cluster import ClusterOptions
+            cluster = Cluster(
+                'couchbase://{}'.format(cb_host),
+                ClusterOptions(PasswordAuthenticator('Administrator',
+                                                     'password')))
+            return cluster
+
+    def get_bucket(self, name):
+        try:
+            return self.cluster.open_bucket(name)
+        except Exception:
+            return self.cluster.bucket(name)
+
+
+class Configuration(object):
     # Input map of keywords to be mined for in the logs
     configuration = [
         {
             "component": "memcached",
             "logfiles": "babysitter.log*",
             "services": "all",
-            "keywords": ["exception occurred in runloop", "failover exited with reason", "Basic\s[a-zA-Z]\{10,\}",
+            "keywords": ["exception occurred in runloop",
+                         "failover exited with reason",
+                         "Basic\s[a-zA-Z]\{10,\}",
                          "Menelaus-Auth-User:\["],
             "ignore_keywords": None,
             "check_stats_api": False,
@@ -38,7 +85,10 @@ class SysTestMon():
             "component": "memcached",
             "logfiles": "memcached.log.*",
             "services": "all",
-            "keywords": ["CRITICAL", "Basic\s[a-zA-Z]\{10,\}", "Menelaus-Auth-User:\[", "exception occurred in runloop", "Invalid packet header detected"],
+            "keywords": ["CRITICAL", "Basic\s[a-zA-Z]\{10,\}",
+                         "Menelaus-Auth-User:\[",
+                         "exception occurred in runloop",
+                         "Invalid packet header detected"],
             "ignore_keywords": None,
             "check_stats_api": False,
             "collect_dumps": False
@@ -98,12 +148,12 @@ class SysTestMon():
             "logfiles": "*xdcr*.log*",
             "services": "kv",
             "keywords": ["Failed on calling", "panic", "fatal", "Basic\s[a-zA-Z]\{10,\}", "Menelaus-Auth-User:\[",
-             "non-recoverable error from xmem client", "Unable to respond to caller",
-             "Unable to generate req or resp", "error when making rest call or unmarshalling data",
-             "unable to find last known target manifest version", "net/http: request canceled",
-             "has payloadCompressed but no payload after deserialization",
-             "Error converting VBTask to DCP Nozzle Task",
-	     "Xmem is stuck"],
+                         "non-recoverable error from xmem client", "Unable to respond to caller",
+                         "Unable to generate req or resp", "error when making rest call or unmarshalling data",
+                         "unable to find last known target manifest version", "net/http: request canceled",
+                         "has payloadCompressed but no payload after deserialization",
+                         "Error converting VBTask to DCP Nozzle Task",
+                         "Xmem is stuck"],
             "ignore_keywords": None,
             "check_stats_api": False,
             "collect_dumps": False,
@@ -179,86 +229,92 @@ class SysTestMon():
     # Level of CPU usage after which alert should be raised
     cpu_threshold = 90
 
+    ignore_list = ["Port exited with status 0", "Fatal:false",
+                   "HyracksDataException: HYR0115: Local network error",
+                   "No such file or directory"]
+
+
+class ScriptConfig(object):
+    print_all_logs = False
+    should_collect_dumps = False
+    cbcollect_on_high_mem_cpu_usage = False
+
+    docker_host = None
+    email_recipients = ""
+    state_file_dir = ""
+
+
+class CBCluster(object):
+    def __init__(self, master_node, rest_username, rest_password,
+                 ssh_username, ssh_password):
+        self.master_node = master_node
+        self.rest_username = rest_username
+        self.rest_password = rest_password
+        self.ssh_username = ssh_username
+        self.ssh_password = ssh_password
+        
+
+class SysTestMon(object):
     # 1. Get service map for cluster
     # 2. For each component, get nodes for the requested service
     # 3. SSH to those nodes, grep for specified keywords in specified files
     # 4. Reporting
 
-    ignore_list = ["Port exited with status 0", "Fatal:false", "HyracksDataException: HYR0115: Local network error",
-                   "No such file or directory"]
+    def __init__(self, cluster, run_infinite, start_itr=1):
+        self.logger = Globals.logger
+        self.cluster = cluster
+        self.run_infinite = run_infinite
+        self.state_file = "{}/eagle-eye_{}.state" \
+            .format(ScriptConfig.state_file_dir, cluster.master_node)
 
-    def run(self, master_node, rest_username, rest_password, ssh_username, ssh_password,
-            cbcollect_on_high_mem_cpu_usage, print_all_logs, email_recipients, state_file_dir, run_infinite, logger,
-            should_collect_dumps, docker_host, cb_host):
-        # Logging configuration
-        if not logger:
-            self.logger = logging.getLogger("systestmon")
-            self.logger.setLevel(logging.DEBUG)
-            ch = logging.StreamHandler()
-            ch.setLevel(logging.DEBUG)
-            formatter = logging.Formatter(
-                "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-            ch.setFormatter(formatter)
-            self.logger.addHandler(ch)
-            timestamp = str(datetime.now().strftime('%Y%m%dT_%H%M%S'))
-            fh = logging.FileHandler("./systestmon-{0}.log".format(timestamp))
-            fh.setFormatter(formatter)
-            self.logger.addHandler(fh)
-        else:
-            self.logger = logger
+        self.keyword_counts = dict()
+        self.keyword_counts["timestamp"] = Globals.timestamp
 
-        self.wait_for_cluster_init(master_node)
+        self.dump_dir_name = ""
+        self.docker_logs_dump = ""
+        self.iter_count = start_itr
 
-        try:
-            self.cluster = self.get_cluster(cb_host)
-            self.bucket = self.get_bucket("system_test_dashboard")
-        except Exception:
-            pass
-
-        self.run_infinite = ast.literal_eval(run_infinite)
-        self.should_collect_dumps = ast.literal_eval(should_collect_dumps)
-        paramiko.util.log_to_file('./paramiko.log')
-
-        timestamp = str(datetime.now().strftime('%Y-%m-%dT%H:%M:%S'))
-
-        self.keyword_counts = {}
-        self.keyword_counts["timestamp"] = timestamp
-        self.state_file = state_file_dir + "/eagle-eye_" + master_node + ".state"
+    def run(self):
+        self.wait_for_cluster_init(self.cluster.master_node)
         last_scan_timestamp = ""
-        iter_count = 1
         while True:
+            msg_sub = ""
+            msg_content = ""
+            should_cbcollect = False
+            prev_keyword_counts = None
+            self.dump_dir_name = "dump_collected_{}".format(self.iter_count)
+
             if os.path.exists(self.state_file):
                 s = open(self.state_file, 'r').read()
                 prev_keyword_counts = ast.literal_eval(s)
-                last_scan_timestamp = datetime.strptime(prev_keyword_counts["last_scan_timestamp"],
-                                                        "%Y-%m-%d %H:%M:%S.%f")
-            else:
-                prev_keyword_counts = None
-            self.dump_dir_name = "dump_collected_" + str(iter_count)
+                last_scan_timestamp = datetime.strptime(
+                    prev_keyword_counts["last_scan_timestamp"],
+                    "%Y-%m-%d %H:%M:%S.%f")
+
             if not os.path.isdir(self.dump_dir_name):
                 os.mkdir(self.dump_dir_name)
-            should_cbcollect = False
-            message_content = ""
-            message_sub = ""
-            node_map = self.get_services_map(master_node, rest_username, rest_password)
+            node_map = self.get_services_map(self.cluster.master_node,
+                                             self.cluster.rest_username,
+                                             self.cluster.rest_password)
             if not node_map:
                 continue
-            for component in self.configuration:
+
+            for component in Configuration.configuration:
                 nodes = self.find_nodes_with_service(node_map,
                                                      component["services"])
-                self.logger.info(
-                    "Nodes with {0} service : {1}".format(component["services"],
-                                                          str(nodes)))
+                self.logger.info("{} - Nodes with {} service : {}"
+                                 .format(self.cluster.master_node,
+                                         component["services"], str(nodes)))
                 for keyword in component["keywords"]:
                     key = component["component"] + "_" + keyword
                     self.logger.info(
-                        "--+--+--+--+-- Parsing logs for {0} component looking for {1} --+--+--+--+--".format(
-                            component["component"], keyword))
+                        "{} - Parsing for component: {}, looking for '{}'"
+                        .format(self.cluster.master_node,
+                                component["component"], keyword))
                     total_occurences = 0
 
                     for node in nodes:
                         if component["ignore_keywords"]:
-
                             command = "zgrep -i \"{0}\" /opt/couchbase/var/lib/couchbase/logs/{1} | grep -vE \"{2}\"".format(
                                 keyword, component["logfiles"], "|".join(component["ignore_keywords"]))
                         else:
@@ -267,37 +323,43 @@ class SysTestMon():
                         occurences = 0
                         try:
                             occurences, output, std_err = self.execute_command(
-                                command, node, ssh_username, ssh_password)
+                                command, node, self.cluster.ssh_username,
+                                self.cluster.ssh_password)
                         except Exception as e:
-                            self.logger.info("Found an exception {0}".format(e))
-                            message_content = message_content + '\n\n' + node + " : " + str(component["component"])
-                            message_content = message_content + '\n\n' + "Found an exception {0}".format(e) + "\n"
+                            self.logger.info("Exception {0}".format(e))
+                            msg_content = msg_content + '\n\n' + node \
+                                          + " : " + str(component["component"])
+                            msg_content = \
+                                msg_content + '\n\n' \
+                                + "Found an exception {0}".format(e) + "\n"
                         if occurences > 0:
-                            self.logger.warn(
-                                "*** {0} occurences of {1} keyword found on {2} ***".format(
-                                    occurences,
-                                    keyword,
-                                    node))
-                            message_content = message_content + '\n\n' + node + " : " + str(component["component"])
-                            if print_all_logs.lower() == "true" or last_scan_timestamp == "":
+                            self.logger.warning(
+                                "Node {} - {} occurences of {} keyword found"
+                                .format(node, occurences, keyword))
+                            msg_content = msg_content + '\n\n' + node + " : " + str(component["component"])
+                            if ScriptConfig.print_all_logs \
+                                    or last_scan_timestamp == "":
                                 self.logger.debug('\n'.join(output))
                                 try:
-                                    message_content = message_content + '\n' + '\n'.join(output)
+                                    msg_content = msg_content + '\n' \
+                                                  + '\n'.join(output)
                                 except UnicodeDecodeError as e:
-                                    self.logger.warn(str(e))
-                                    message_content = message_content + '\n' + '\n'.join(output).decode("utf-8")
+                                    self.logger.warning(str(e))
+                                    msg_content = msg_content + '\n' + '\n'.join(output).decode("utf-8")
                             else:
-                                message_content = self.print_output(output, last_scan_timestamp, message_content)
+                                msg_content = self.print_output(output, last_scan_timestamp, msg_content)
                             # for i in range(len(output)):
                             #    self.logger.info(output[i])
                         total_occurences += occurences
 
                     self.keyword_counts[key] = total_occurences
-                    if prev_keyword_counts is not None and key in prev_keyword_counts.keys():
+                    if prev_keyword_counts is not None \
+                            and key in prev_keyword_counts.keys():
                         if total_occurences > int(prev_keyword_counts[key]):
-                            self.logger.warn(
-                                "There have been more occurences of keyword {0} in the logs since the last iteration. Hence performing a cbcollect.".format(
-                                    keyword))
+                            self.logger.warning(
+                                "There have been more occurences of keyword {0} "
+                                "in the logs since the last iteration. Hence "
+                                "performing a cbcollect.".format(keyword))
                             should_cbcollect = True
                     else:
                         if total_occurences > 0:
@@ -305,50 +367,65 @@ class SysTestMon():
 
                 for node in nodes:
                     if component["check_stats_api"]:
-                        message_content = message_content + '\n\n' + node + " : " + str(component["component"])
+                        msg_content = msg_content + '\n\n' + node + " : " + str(component["component"])
                         try:
-                            fin_neg_stat, message_content = self.check_stats_api(node, component, message_content)
+                            fin_neg_stat, msg_content = self.check_stats_api(node, component, msg_content)
                             if fin_neg_stat.__len__() != 0:
                                 should_cbcollect = True
                         except Exception as e:
                             self.logger.info("Found an exception {0}".format(e))
 
-                    if component["collect_dumps"] and self.should_collect_dumps:
-                        message_content = message_content + '\n\n' + node + " : " + str(
+                    if component["collect_dumps"] and ScriptConfig.should_collect_dumps:
+                        msg_content = msg_content + '\n\n' + node + " : " + str(
                             component["component"]) + " Collecting dumps"
                         try:
-                            message_content = self.collect_dumps(node, component, message_content)
+                            msg_content = self.collect_dumps(node, component, msg_content)
                         except Exception as e:
                             self.logger.info("Found an exception {0}".format(e))
 
                 # Check if all n1ql nodes are healthy
                 if component["component"] == "query":
-                    n1ql_nodes = self.find_nodes_with_service(node_map,"n1ql")
+                    n1ql_nodes = self.find_nodes_with_service(node_map, "n1ql")
                     if n1ql_nodes:
                         # Check to make sure all nodes are healthy
-                        self.logger.info("Checking if all query nodes are healthy")
-                        should_collect, message = self.check_nodes_healthy(nodes=nodes, component=component, rest_username=rest_username, rest_password=rest_password, ssh_username=ssh_username, ssh_password=ssh_password)
+                        self.logger.info("Checking query nodes for health")
+                        should_collect, message = self.check_nodes_healthy(
+                            nodes=nodes, component=component,
+                            rest_username=self.cluster.rest_username,
+                            rest_password=self.cluster.rest_password,
+                            ssh_username=self.cluster.ssh_username,
+                            ssh_password=self.cluster.ssh_password)
                         if should_collect:
                             should_cbcollect = True
                         if not message == '':
-                            message_content = message_content + '\n\n' + node + " : " + str(component["component"])
-                            message_content = message_content + '\n\n' + message + "\n"
+                            msg_content = msg_content + '\n\n' + node + " : " + str(component["component"])
+                            msg_content = msg_content + '\n\n' + message + "\n"
                         # Check system:completed_requests for errors
                         self.logger.info("Checking system:completed requests for errors")
-                        should_collect, message = self.check_completed_requests(nodes=nodes, component=component, rest_username=rest_username, rest_password=rest_password, ssh_username=ssh_username, ssh_password=ssh_password)
+                        should_collect, message = self.check_completed_requests(
+                            nodes=nodes, component=component,
+                            rest_username=self.cluster.rest_username,
+                            rest_password=self.cluster.rest_password,
+                            ssh_username=self.cluster.ssh_username,
+                            ssh_password=self.cluster.ssh_password)
                         if should_collect:
                             should_cbcollect = True
                         if not message == '':
-                            message_content = message_content + '\n\n' + node + " : " + str(component["component"])
-                            message_content = message_content + '\n\n' + message + "\n"
+                            msg_content = msg_content + '\n\n' + node + " : " + str(component["component"])
+                            msg_content = msg_content + '\n\n' + message + "\n"
                         # Check active_requests to make sure that are no more than 1k active requests at a single time
                         self.logger.info("Checking system:active requests for too many requests")
-                        should_collect, message = self.check_active_requests(nodes=nodes, component=component, rest_username=rest_username, rest_password=rest_password, ssh_username=ssh_username, ssh_password=ssh_password)
+                        should_collect, message = self.check_active_requests(
+                            nodes=nodes, component=component,
+                            rest_username=self.cluster.rest_username,
+                            rest_password=self.cluster.rest_password,
+                            ssh_username=self.cluster.ssh_username,
+                            ssh_password=self.cluster.ssh_password)
                         if should_collect:
                             should_cbcollect = True
                         if not message == '':
-                            message_content = message_content + '\n\n' + node + " : " + str(component["component"])
-                            message_content = message_content + '\n\n' + message + "\n"
+                            msg_content = msg_content + '\n\n' + node + " : " + str(component["component"])
+                            msg_content = msg_content + '\n\n' + message + "\n"
 
                 # # Check if XDCR outgoing mutations in the past hour > threshold
                 # if component["component"] == "xdcr":
@@ -367,74 +444,79 @@ class SysTestMon():
 
             # Check for health of all nodes
             for node in node_map:
-                if node["memUsage"] > self.mem_threshold:
-                    self.logger.warn(
-                        "***** ALERT : Memory usage on {0} is very high : {1}%".format(
-                            node["hostname"], node["memUsage"]))
+                if node["memUsage"] > Configuration.mem_threshold:
+                    self.logger.warning(
+                        "***** ALERT : Memory usage on {0} is very high : {1}%"
+                        .format(node["hostname"], node["memUsage"]))
                     # if cbcollect_on_high_mem_cpu_usage:
                     #    should_cbcollect = True
 
-                if node["cpuUsage"] > self.cpu_threshold:
-                    self.logger.warn(
-                        "***** ALERT : CPU usage on {0} is very high : {1}%".format(
-                            node["hostname"], node["cpuUsage"]))
+                if node["cpuUsage"] > Configuration.cpu_threshold:
+                    self.logger.warning(
+                        "***** ALERT : CPU usage on {0} is very high : {1}%"
+                        .format(node["hostname"], node["cpuUsage"]))
                     # if cbcollect_on_high_mem_cpu_usage:
                     #    should_cbcollect = True
 
                 if node["status"] != "healthy":
-                    self.logger.warn(
-                        "***** ALERT : {0} is not healthy. Current status : {1}%".format(
-                            node["hostname"], node["status"]))
-                    if cbcollect_on_high_mem_cpu_usage:
+                    self.logger.warning(
+                        "***** ALERT: {0} is not healthy. Current status: {1}%"
+                        .format(node["hostname"], node["status"]))
+                    if ScriptConfig.cbcollect_on_high_mem_cpu_usage:
                         should_cbcollect = True
                 # self.check_on_ntp_status(node["hostname"])
                 self.check_on_disk_usage(node["hostname"])
 
             last_scan_timestamp = datetime.now() - timedelta(minutes=10.0)
-            self.logger.info("Last scan timestamp :" + str(last_scan_timestamp))
+            self.logger.info("Last scan timestamp:" + str(last_scan_timestamp))
             self.keyword_counts["last_scan_timestamp"] = str(last_scan_timestamp)
 
-            if docker_host != "None":
+            if ScriptConfig.docker_host is not None:
                 try:
                     command = "docker ps -q | xargs docker inspect --format {{.LogPath}}"
                     occurences, output, std_err = self.execute_command(
-                        command, docker_host, ssh_username, ssh_password)
-
-                    self.docker_logs_dump = "docker_dump_collected_" + str(iter_count) \
+                        command, ScriptConfig.docker_host,
+                        self.cluster.ssh_username, self.cluster.ssh_password)
+                    self.docker_logs_dump = "docker_dump_collected_" + str(self.iter_count) \
                                             + "_" + str(datetime.now().strftime('%Y-%m-%dT%H:%M:%S'))
                     os.mkdir(self.docker_logs_dump)
 
-                    ssh_client = self.get_ssh_client(docker_host, ssh_username, ssh_password)
+                    ssh_client = self.get_ssh_client(
+                        ScriptConfig.docker_host, self.cluster.ssh_username,
+                        self.cluster.ssh_password)
 
                     for file in output:
                         with SCPClient(ssh_client.get_transport()) as scp:
                             scp.get(file, local_path=self.docker_logs_dump)
 
                     docker_logs_location = "{0}/{1}".format(os.getcwd(), self.docker_logs_dump)
-                    message_content = message_content + '\n\n Docker logs collected at: ' + docker_logs_location
-
-                    self.logger.info(
-                        "Collecting all docker logs completed. Docker logs at : {0}".format(docker_logs_location))
+                    msg_content = msg_content + '\n\n Docker logs collected at: ' + docker_logs_location
+                    self.logger.info("Collecting all docker logs completed. "
+                                     "Docker logs at : {0}"
+                                     .format(docker_logs_location))
                 except Exception as e:
-                    self.logger.info("Could not collect docker logs : {0}".format(str(e)))
-
-
+                    self.logger.info("Could not collect docker logs: {0}".format(str(e)))
 
             collected = False
             start_time = time.time()
 
-            while should_cbcollect and not collected and time.time() < (start_time + (60 * 60)):
-                self.logger.info("====== RUNNING CBCOLLECT_INFO ======")
-                # command = "/opt/couchbase/bin/cbcollect_info outputfile.zip --multi-node-diag --upload-host=s3.amazonaws.com/bugdb/jira --customer=systestmon-{0}".format(
-                #    timestamp)
+            while should_cbcollect and not collected \
+                    and time.time() < (start_time + (60 * 60)):
+                self.logger.info("{} :: RUNNING CBCOLLECT_INFO"
+                                 .format(self.cluster.master_node))
                 epoch_time = int(time.time())
-                command = "/opt/couchbase/bin/couchbase-cli collect-logs-start -c {0} -u {1} -p {2} --all-nodes --upload --upload-host cb-jira.s3.us-east-2.amazonaws.com/logs --customer systestmon-{3}".format(
-                    master_node, rest_username, rest_password, epoch_time)
+                command = "/opt/couchbase/bin/couchbase-cli collect-logs-start " \
+                          "-c {0} -u {1} -p {2} --all-nodes --upload " \
+                          "--upload-host cb-jira.s3.us-east-2.amazonaws.com/logs " \
+                          "--customer systestmon-{3}"\
+                          .format(self.cluster.master_node,
+                                  self.cluster.rest_username,
+                                  self.cluster.rest_password, epoch_time)
                 _, cbcollect_output, std_err = self.execute_command(
-                    command, master_node, ssh_username, ssh_password)
+                    command, self.cluster.master_node,
+                    self.cluster.ssh_username, self.cluster.ssh_password)
                 if std_err:
-                    self.logger.error(
-                        "Error seen while running cbcollect_info ")
+                    self.logger.error("Error while running cbcollect_info")
                     self.logger.info(std_err)
                 else:
                     for i in range(len(cbcollect_output)):
@@ -442,17 +524,16 @@ class SysTestMon():
 
                 while True:
                     command = "/opt/couchbase/bin/couchbase-cli collect-logs-status -c {0} -u {1} -p {2}".format(
-                        master_node, rest_username, rest_password)
+                        self.cluster.master_node,
+                        self.cluster.rest_username, self.cluster.rest_password)
                     _, cbcollect_output, std_err = self.execute_command(
-                        command, master_node, ssh_username, ssh_password)
+                        command, self.cluster.master_node,
+                        self.cluster.ssh_username, self.cluster.ssh_password)
                     if std_err:
-                        self.logger.error(
-                            "Error seen while running cbcollect_info ")
+                        self.logger.error("Error while running cbcollect_info")
                         self.logger.info(std_err)
                         break
                     else:
-                        # for i in range(len(cbcollect_output)):
-                        #    print cbcollect_output[i]
                         if cbcollect_output[0] == "Status: completed":
                             cbcollect_upload_paths = []
                             for line in cbcollect_output:
@@ -460,10 +541,10 @@ class SysTestMon():
                                     cbcollect_upload_paths.append(line)
                             self.logger.info("cbcollect upload paths : \n")
                             self.logger.info('\n'.join(cbcollect_upload_paths))
-                            message_content = message_content + '\n\ncbcollect logs: \n\n' + '\n'.join(
-                                cbcollect_upload_paths)
-                            # for i in range(len(cbcollect_upload_paths)):
-                            #    print cbcollect_upload_paths[i]
+                            msg_content = \
+                                msg_content + \
+                                '\n\ncbcollect logs: \n\n' + '\n'.join(
+                                    cbcollect_upload_paths)
                             collected = True
                             break
                         elif cbcollect_output[0] == "Status: running":
@@ -474,137 +555,106 @@ class SysTestMon():
                         else:
                             self.logger.error("Issue with cbcollect")
                             break
-
             self.update_state_file()
 
             self.logger.info(
                 "====== Log scan iteration number {0} complete"
-                "======".format(iter_count))
-            message_sub = message_sub.join(
-                "Node: {0} : Log scan iteration number {1} complete".format(master_node, iter_count))
+                "======".format(self.iter_count))
+            msg_sub = msg_sub.join(
+                "Node: {0} : Log scan iteration number {1} complete"
+                .format(self.cluster.master_node, self.iter_count))
             if should_cbcollect:
-                self.send_email(message_sub, message_content, email_recipients)
+                self.send_email(msg_sub, msg_content,
+                                ScriptConfig.email_recipients)
                 try:
-                    self.store_results(message_sub, message_content)
+                    Globals.sdk_client.store_results(msg_sub, msg_content)
                 except Exception:
                     pass
-            iter_count = iter_count + 1
 
             if not self.run_infinite:
                 break
-            if time.time() - start_time >= self.scan_interval:
+            self.iter_count = self.iter_count + 1
+
+            if time.time() - start_time >= Configuration.scan_interval:
                 continue
             else:
-                sleep_time = self.scan_interval - int(time.time() - start_time)
-                self.logger.info(
-                    "====== Sleeping for {0} seconds ======".format(sleep_time))
+                sleep_time = Configuration.scan_interval \
+                             - int(time.time() - start_time)
+                self.logger.info("====== Sleeping for {0} seconds ======"
+                                 .format(sleep_time))
                 time.sleep(sleep_time)
 
     def get_ssh_client(self, host, username, password):
         client = paramiko.SSHClient()
         client.load_system_host_keys()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(host, username=username, password=password, timeout=120, banner_timeout=120)
+        client.connect(host, username=username, password=password,
+                       timeout=120, banner_timeout=120)
         return client
 
     def check_on_disk_usage(self, node):
-        self.logger.info("=======" + node + "===========")
+        self.logger.info("{} :: check_on_disk_usage".format(node))
         command = "df -kh /data"
         _, df_output, std_err = self.execute_command(
-            command, node, ssh_username, ssh_password)
+            command, node, self.cluster.ssh_username,
+            self.cluster.ssh_password)
         if std_err:
-            self.logger.error(
-                "Error seen while running df -kh ")
+            self.logger.error("Error seen while running df -kh ")
             self.logger.info(std_err)
         else:
             for i in range(len(df_output)):
                 self.logger.info(df_output[i])
 
     def check_on_ntp_status(self, node):
-        self.logger.info("=======" + node + "===========")
+        self.logger.info("{} :: check_on_ntp_status".format(node))
         command = "timedatectl status | grep NTP"
         _, df_output, std_err = self.execute_command(
-            command, node, ssh_username, ssh_password)
+            command, node, self.cluster.ssh_username,
+            self.cluster.ssh_password)
         if std_err:
-            self.logger.error(
-                "Error seen while running df -kh ")
+            self.logger.error("Error seen while running df -kh ")
             self.logger.info(std_err)
         else:
             for i in range(len(df_output)):
                 self.logger.info(df_output[i])
 
-    def get_cluster(self, cb_host):
-        try:
-            cluster = Cluster('couchbase://{}'.format(cb_host))
-            authenticator = PasswordAuthenticator('Administrator', 'password')
-            cluster.authenticate(authenticator)
-            return cluster
-        except Exception:
-            from couchbase.cluster import ClusterOptions
-            cluster = Cluster('couchbase://{}'.format(cb_host), ClusterOptions(PasswordAuthenticator('Administrator', 'password')))
-            return cluster
-
-    def get_bucket(self, name):
-        try:
-            return self.cluster.open_bucket(name)
-        except Exception:
-            return self.cluster.bucket(name)
-
-    def append_list(self, key, value):
-        try:
-            self.bucket.list_append(key, value, create=True)
-        except Exception:
-            self.bucket.default_collection().list_append(key, value, create=True)
-
-    def store_results(self, message_sub, message_content):
-        build_id = os.getenv("BUILD_NUMBER")
-        if build_id is not None:
-            key = "log_parser_results_" + build_id
-            self.append_list(key, message_sub + "\n" + message_content)
-
-    def send_email(self, message_sub, message_content, email_recipients):
+    def send_email(self, msg_sub, msg_content, email_recipients):
         SENDMAIL = "/usr/sbin/sendmail"  # sendmail location
-
         FROM = "eagle-eye@couchbase.com"
         TO = email_recipients
-
-        SUBJECT = message_sub
-
-        TEXT = message_content
+        SUBJECT = msg_sub
+        TEXT = msg_content
 
         # Prepare actual message
-
-        message = ('From: %s\n'
-                   'To: %s\n'
-                   'Subject: %s\n'
-                   '\n'
-                   '%s\n') % (FROM, TO, SUBJECT, TEXT)
+        msg = ('From: %s\n'
+               'To: %s\n'
+               'Subject: %s\n'
+               '\n'
+               '%s\n') % (FROM, TO, SUBJECT, TEXT)
 
         # Send the mail
-        import os
-
         p = os.popen("%s -t -i" % SENDMAIL, "w")
         try:
-            p.write(message)
+            p.write(msg)
         except UnicodeEncodeError as e:
-            self.logger.warn(str(e))
-            p.write(message.encode("utf-8"))
+            self.logger.warning(str(e))
+            p.write(msg.encode("utf-8"))
         status = p.close()
-        if status:
-            print "Sendmail exit status", status
+        self.logger.info("Sendmail exit status: {}".format(status))
 
     def update_state_file(self):
         target = open(self.state_file, 'w')
         target.write(str(self.keyword_counts))
 
-    def collect_dumps(self, node, component, message_content):
-        goroutine_dump_name, cpupprof_dump_name, heappprof_dump_name = self.get_dumps(node, component["port"])
-        message_content = message_content + '\n' + "Dump Location : " + '\n' + goroutine_dump_name + '\n' + cpupprof_dump_name + '\n' + heappprof_dump_name
-        return message_content
+    def collect_dumps(self, node, component, msg_content):
+        goroutine_dump_name, cpupprof_dump_name, heappprof_dump_name = \
+            self.get_dumps(node, component["port"])
+        msg_content = msg_content + '\n' + "Dump Location : " + '\n' \
+                      + goroutine_dump_name + '\n' + cpupprof_dump_name \
+                      + '\n' + heappprof_dump_name
+        return msg_content
 
-
-    def check_stats_api(self, node, component, message_content):
-
+    def check_stats_api(self, node, component, msg_content):
         fin_neg_stat = []
         for stat in component["stats_api_list"]:
             stat_json = self.get_stats(stat, node, component["port"])
@@ -614,9 +664,9 @@ class SysTestMon():
             else:
                 neg_stat = None
             self.logger.info(str(stat) + " : " + str(neg_stat))
-            message_content = message_content + '\n' + str(stat) + " : " + str(neg_stat)
+            msg_content = msg_content + '\n' + str(stat) + " : " + str(neg_stat)
 
-        return fin_neg_stat, message_content
+        return fin_neg_stat, msg_content
 
     def check_for_negative_stat(self, stat_json):
         queue = deque([stat_json])
@@ -644,14 +694,15 @@ class SysTestMon():
         cpupprof_dump_name = "{0}/{1}/cpupprof_{2}".format(os.getcwd(), self.dump_dir_name, node)
         heappprof_dump_name = "{0}/{1}/heappprof_{2}".format(os.getcwd(), self.dump_dir_name, node)
 
-        heap_dump_cmd = "curl http://{0}:{1}/debug/pprof/heap?debug=1 -u Administrator:password > {2}".format(node,
-                                                                                                              port,
-                                                                                                              heappprof_dump_name)
-        cpu_dump_cmd = "curl http://{0}:{1}/debug/pprof/profile?debug=1 -u Administrator:password > {2}".format(node,
-                                                                                                                port,
-                                                                                                                cpupprof_dump_name)
-        goroutine_dump_cmd = "curl http://{0}:{1}/debug/pprof/goroutine?debug=1 -u Administrator:password > {2}".format(
-            node, port, goroutine_dump_name)
+        heap_dump_cmd = "curl http://{0}:{1}/debug/pprof/heap?debug=1 " \
+                        "-u Administrator:password > {2}"\
+                        .format(node, port, heappprof_dump_name)
+        cpu_dump_cmd = "curl http://{0}:{1}/debug/pprof/profile?debug=1 " \
+                       "-u Administrator:password > {2}"\
+                       .format(node, port, cpupprof_dump_name)
+        goroutine_dump_cmd = "curl http://{0}:{1}/debug/pprof/goroutine?debug=1 " \
+                             "-u Administrator:password > {2}"\
+                             .format(node, port, goroutine_dump_name)
 
         self.logger.info(heap_dump_cmd)
         os.system(heap_dump_cmd)
@@ -668,10 +719,9 @@ class SysTestMon():
         api = "http://{0}:{1}/{2}".format(node, port, stat)
         json_parsed = {}
 
-        status, content, header = self._http_request(api)
+        status, content, _ = self._http_request(api)
         if status:
             json_parsed = json.loads(content)
-            # self.logger.info(json_parsed)
         return json_parsed
 
     def convert_output_to_json(self, output):
@@ -681,41 +731,47 @@ class SysTestMon():
         return json_output
 
     def check_nodes_healthy(self, nodes, component, rest_username, rest_password, ssh_username, ssh_password):
-        message_content = ''
+        msg_content = ''
         should_cbcollect = False
         for node in nodes:
-            command = "curl http://{0}:{1}/query/service -u {2}:{3} -d 'statement=select 1'".format(node,
-                                                                                                    component["port"],
-                                                                                                    rest_username,
-                                                                                                    rest_password)
+            command = "curl http://{0}:{1}/query/service -u {2}:{3} " \
+                      "-d 'statement=select 1'"\
+                      .format(node, component["port"], rest_username,
+                              rest_password)
             self.logger.info("Running curl: {0}".format(command))
             try:
                 occurences, output, std_err = self.execute_command(
                     command, node, ssh_username, ssh_password)
                 self.logger.info("Node:{0} Results:{1}".format(node, str(output)))
-                if "Empty reply from server" in str(output) or "failed to connect" in str(output) or "timeout" in str(
-                        output):
+                if "Empty reply from server" in str(output) \
+                        or "failed to connect" in str(output) \
+                        or "timeout" in str(output):
                     self.logger.error(
-                        "The n1ql service appears to be unhealthy! Select 1 from node {0} failed! {1}".format(node,
-                                                                                                              output))
+                        "The n1ql service appears to be unhealthy! "
+                        "Select 1 from node {0} failed! {1}"
+                        .format(node, output))
                     should_cbcollect = True
             except Exception as e:
                 self.logger.info("Found an exception {0}".format(e))
-                message_content = message_content + '\n\n' + node + " : " + str(component["component"])
-                message_content = message_content + '\n\n' + "Found an exception {0}".format(e) + "\n"
+                msg_content = msg_content + '\n\n' + node + " : " + str(component["component"])
+                msg_content = msg_content + '\n\n' + "Found an exception {0}".format(e) + "\n"
+        return should_cbcollect, msg_content
 
-        return should_cbcollect, message_content
-
-    def check_completed_requests(self, nodes, component, rest_username, rest_password, ssh_username, ssh_password):
-        message_content = ''
+    def check_completed_requests(self, nodes, component, rest_username,
+                                 rest_password, ssh_username, ssh_password):
+        msg_content = ''
         should_cbcollect = False
         collection_timestamp = time.time()
         collection_timestamp = datetime.fromtimestamp(collection_timestamp).strftime('%Y-%m-%dT%H:%M:%S')
         path = os.getcwd()
         file = "query_completed_requests_errors_{0}.txt".format(collection_timestamp)
         # Group the errors by the number of occurences of each distinct error message
-        command = "curl http://{0}:{1}/query/service -u {2}:{3} -d 'statement=select count(errors[0].message) as errorCount, errors[0].message from system:completed_requests where errorCount > 0 group by errors[0].message'".format(
-            nodes[0], component["port"], rest_username, rest_password)
+        command = "curl http://{0}:{1}/query/service -u {2}:{3} " \
+                  "-d 'statement=select count(errors[0].message) " \
+                  "as errorCount, errors[0].message from system:completed_requests " \
+                  "where errorCount > 0 group by errors[0].message'"\
+                  .format(nodes[0], component["port"], rest_username,
+                          rest_password)
         self.logger.info("Running curl: {0}".format(command))
         try:
             occurences, output, std_err = self.execute_command(
@@ -740,13 +796,13 @@ class SysTestMon():
                                 if "errors" in str(e):
                                     continue
                                 else:
-                                    self.loger.info("There was an exception {0}".format(str(e)))
+                                    self.logger.info("There was an exception {0}".format(str(e)))
                         # Some errors need to be checked out further in order to see if they need to be filtered
                         elif "Commit Transaction statement error" in result['message']:
                             try:
                                 command = "curl http://{0}:{1}/query/service -u {2}:{3} -d 'statement=select * from system:completed_requests where errors[0].message = \"{4}\"'".format(
                                     nodes[0], component["port"], rest_username, rest_password, result['message'])
-                                self.logger.info("Running curl: {0}".format(command))
+                                self.logger.info("{} - Running curl: {0}".format(nodes[0], command))
                                 occurences, output, std_err = self.execute_command(
                                     command, nodes[0], ssh_username, ssh_password)
                                 # Convert the output to a json dict that we can parse
@@ -761,15 +817,16 @@ class SysTestMon():
                                             command = "curl http://{0}:{1}/query/service -u {2}:{3} -d 'statement=delete from system:completed_requests where errors[0].cause.cause.cause = \"{4}\"'".format(
                                                 nodes[0], component["port"], rest_username, rest_password,
                                                 result['errors'][0]['cause']['cause']['cause'])
-                                            self.logger.info("Running curl: {0}".format(command))
-                                            occurences, output, std_err = self.execute_command(
-                                                command, nodes[0], ssh_username, ssh_password)
+                                            self.logger.info("{} - Running curl: {}".format(nodes[0], command))
+                                            _, _, _ = self.execute_command(
+                                                command, nodes[0],
+                                                ssh_username, ssh_password)
                             except Exception as e:
                                 if "errors" in str(e):
                                     continue
                                 else:
-                                    self.loger.info("There was an exception {0}".format(str(e)))
-                            #add elifs here to mimic the above to filter more known causes of error messages
+                                    self.logger.info("There was an exception {0}".format(str(e)))
+                            # add elifs here to mimic the above to filter more known causes of error messages
                 command = "curl http://{0}:{1}/query/service -u {2}:{3} -d 'statement=select count(errors[0].message) as errorCount, errors[0].message from system:completed_requests where errorCount > 0 group by errors[0].message'".format(
                     nodes[0], component["port"], rest_username, rest_password)
                 occurences, output, std_err = self.execute_command(
@@ -791,22 +848,24 @@ class SysTestMon():
                             # Convert the output to a json dict that we can parse
                             results = self.convert_output_to_json(output)
                             self.logger.info(
-                                "Sample result for error message '{0}' at time {1}: {2}".format(result['message'],
-                                                                                                results['results'][0][
-                                                                                                    'completed_requests'][
-                                                                                                    'requestTime'],
-                                                                                                results['results']))
-                            # Update message_content to show errors were found
-                            message_content = message_content + '\n\n' + nodes[0] + " : " + str(component["component"])
-                            message_content = message_content + '\n\n' + "Sample result for error message '{0}' at time {1}: {2}".format(result['message'],
+                                "Sample result for error message '{0}' at time {1}: {2}"
+                                .format(result['message'],
+                                        results['results'][0]['completed_requests']['requestTime'],
+                                        results['results']))
+                            # Update msg_content to show errors were found
+                            msg_content = msg_content + '\n\n' + nodes[0] + " : " + str(component["component"])
+                            msg_content = msg_content + '\n\n' + "Sample result for error message '{0}' at time {1}: {2}".format(result['message'],
                                                                                                 results['results'][0][
                                                                                                     'completed_requests'][
                                                                                                     'requestTime'],
                                                                                                 results['results']) + "\n"
                     # Get the entire completed_requests errors and dump them to a file
-                    command = "curl http://{0}:{1}/query/service -u {2}:{3} -d 'statement=select * from system:completed_requests where errorCount > 0 order by requestTime desc'".format(
-                        nodes[0], component["port"], rest_username, rest_password)
-                    self.logger.info("Running curl: {0}".format(command))
+                    command = "curl http://{0}:{1}/query/service -u {2}:{3} " \
+                              "-d 'statement=select * from system:completed_requests " \
+                              "where errorCount > 0 order by requestTime desc'"\
+                        .format(nodes[0], component["port"], rest_username,
+                                rest_password)
+                    self.logger.info("{} = Running curl: {0}".format(nodes[0], command))
                     try:
                         occurences, output, std_err = self.execute_command(
                             command, nodes[0], ssh_username, ssh_password)
@@ -836,18 +895,19 @@ class SysTestMon():
                             should_cbcollect = True
                     except Exception as e:
                         self.logger.info("Found an exception {0}".format(e))
-                        message_content = message_content + '\n\n' + nodes[0] + " : " + str(component["component"])
-                        message_content = message_content + '\n\n' + "Found an exception {0}".format(e) + "\n"
+                        msg_content = msg_content + '\n\n' + nodes[0] + " : " + str(component["component"])
+                        msg_content = msg_content + '\n\n' + "Found an exception {0}".format(e) + "\n"
 
         except Exception as e:
             self.logger.info("Found an exception {0}".format(e))
-            message_content = message_content + '\n\n' + nodes[0] + " : " + str(component["component"])
-            message_content = message_content + '\n\n' + "Found an exception {0}".format(e) + "\n"
+            msg_content = msg_content + '\n\n' + nodes[0] + " : " + str(component["component"])
+            msg_content = msg_content + '\n\n' + "Found an exception {0}".format(e) + "\n"
 
-        return should_cbcollect, message_content
+        return should_cbcollect, msg_content
 
-    def check_active_requests(self, nodes, component, rest_username, rest_password, ssh_username, ssh_password):
-        message_content = ''
+    def check_active_requests(self, nodes, component, rest_username,
+                              rest_password, ssh_username, ssh_password):
+        msg_content = ''
         should_cbcollect = False
         collection_timestamp = time.time()
         collection_timestamp = datetime.fromtimestamp(collection_timestamp).strftime('%Y-%m-%dT%H:%M:%S')
@@ -865,8 +925,8 @@ class SysTestMon():
             if results['metrics']['resultCount'] > 1000:
                 self.logger.info(
                     "There are more than 1000 queries running at time {0}, this should not be the case. Storing active_requests for further review".format(collection_timestamp))
-                message_content = message_content + '\n\n' + nodes[0] + " : " + str(component["component"])
-                message_content = message_content + '\n\n' + "There are more than 1000 queries running at time {0}, this should not be the case. Storing active_requests for further review".format(collection_timestamp) + "\n"
+                msg_content = msg_content + '\n\n' + nodes[0] + " : " + str(component["component"])
+                msg_content = msg_content + '\n\n' + "There are more than 1000 queries running at time {0}, this should not be the case. Storing active_requests for further review".format(collection_timestamp) + "\n"
                 with open(os.path.join(path, file), 'w') as fp:
                     json.dump(results, fp, indent=4)
                     fp.close()
@@ -878,10 +938,24 @@ class SysTestMon():
                 should_cbcollect = True
         except Exception as e:
             self.logger.info("Found an exception {0}".format(e))
-            message_content = message_content + '\n\n' + nodes[0] + " : " + str(component["component"])
-            message_content = message_content + '\n\n' + "Found an exception {0}".format(e) + "\n"
+            msg_content = msg_content + '\n\n' + nodes[0] + " : " + str(component["component"])
+            msg_content = msg_content + '\n\n' + "Found an exception {0}".format(e) + "\n"
 
-        return should_cbcollect, message_content
+        return should_cbcollect, msg_content
+
+    def get_xdcr_dest(self, node):
+        api = "http://" + node + ":8091/pools/default/remoteClusters"
+        status, content, _ = self._http_request(api)
+        content_array = json.loads(content)
+        xdcr_dest_master_ip = []
+        for content in content_array:
+            if 'hostname' in content:
+                xdcr_dest_ip = content['hostname']
+                xdcr_dest_master_ip.append(xdcr_dest_ip.split(':')[0])
+        if len(xdcr_dest_master_ip) == 0 :
+            self.logger.info("destination ip not found")
+            return None
+        return xdcr_dest_master_ip
 
     def get_xdcr_src_buckets(self, node):
         src_buckets = []
@@ -897,7 +971,6 @@ class SysTestMon():
         status, content, _ = self._http_request(api)
         return json.loads(content)
 
-
     def _create_headers(self):
         authorization = base64.encodestring('%s:%s' % ("Administrator", "password"))
         return {'Content-Type': 'application/x-www-form-urlencoded',
@@ -912,23 +985,25 @@ class SysTestMon():
                 return "auth: " + base64.decodestring(val[6:])
         return ""
 
-    def _http_request(self, api, method='GET', params='', headers=None, timeout=120):
+    def _http_request(self, api, method='GET', params='', headers=None,
+                      timeout=120):
         if not headers:
             headers = self._create_headers()
         end_time = time.time() + timeout
-        self.logger.info("Executing {0} request for following api {1}".format(method, api))
+        self.logger.info("Executing {0} request for following api {1}"
+                         .format(method, api))
         count = 1
         while True:
             try:
-                response, content = httplib2.Http(timeout=timeout).request(api, method,
-                                                                           params, headers)
+                response, content = httplib2.Http(timeout=timeout)\
+                    .request(api, method, params, headers)
                 if response['status'] in ['200', '201', '202']:
                     return True, content, response
                 else:
                     try:
                         json_parsed = json.loads(content)
                     except ValueError as e:
-                        json_parsed = {}
+                        json_parsed = dict()
                         json_parsed["error"] = "status: {0}, content: {1}" \
                             .format(response['status'], content)
                     reason = "unknown"
@@ -956,48 +1031,49 @@ class SysTestMon():
             time.sleep(3)
             count += 1
 
-    def print_output(self, output, last_scan_timestamp, message_content):
+    def print_output(self, output, last_scan_timestamp, msg_content):
         for line in output:
             match = re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', line)
             if match:
                 timestamp_in_log = datetime.strptime(match.group(), '%Y-%m-%dT%H:%M:%S')
-                if timestamp_in_log >= last_scan_timestamp and self.check_op_in_ignorelist(line):
+                if timestamp_in_log >= last_scan_timestamp \
+                        and self.check_op_in_ignorelist(line):
                     self.logger.debug(line)
-                    message_content = message_content + '\n' + line
+                    msg_content = msg_content + '\n' + line
             else:
                 self.logger.debug(line)
-                message_content = message_content + '\n' + line
-                if line.strip() not in self.ignore_list:
-                    self.ignore_list.append(line.strip())
+                msg_content = msg_content + '\n' + line
+                if line.strip() not in Configuration.ignore_list:
+                    Configuration.ignore_list.append(line.strip())
 
-        return message_content
+        return msg_content
 
     def check_op_in_ignorelist(self, line):
-        for ignore_text in self.ignore_list:
+        for ignore_text in Configuration.ignore_list:
             if ignore_text in line:
                 return False
         return True
 
     def get_services_map(self, master, rest_username, rest_password):
         cluster_url = "http://" + master + ":8091/pools/default"
-        node_map = []
+        node_map = list()
         retry_count = 5
+        status = content = None
         while retry_count:
             try:
                 # Get map of nodes in the cluster
-                status, content, header = self._http_request(cluster_url)
-
+                status, content, _ = self._http_request(cluster_url)
                 if status:
                     response = json.loads(str(content))
-
                     for node in response["nodes"]:
-                        clusternode = {}
+                        clusternode = dict()
                         clusternode["hostname"] = node["hostname"].replace(":8091", "")
                         clusternode["services"] = node["services"]
                         mem_used = int(node["memoryTotal"]) - int(node["memoryFree"])
                         if node["memoryTotal"]:
                             clusternode["memUsage"] = round(
-                                float(float(mem_used) / float(node["memoryTotal"]) * 100), 2)
+                                float(float(mem_used)
+                                      / float(node["memoryTotal"]) * 100), 2)
                         else:
                             clusternode["memUsage"] = 0
                         clusternode["cpuUsage"] = round(
@@ -1006,10 +1082,10 @@ class SysTestMon():
                         node_map.append(clusternode)
 
                     break
-            except Exception, e:
-                self.logger.info("Found an exception {0}".format(e))
-                self.logger.info(status)
-                self.logger.info(content)
+            except Exception as e:
+                self.logger.info("Exception in get_service_map: {0}".format(e))
+                self.logger.info("Status: {}, content: {}"
+                                 .format(status, content))
                 node_map = None
 
             time.sleep(300)
@@ -1074,45 +1150,80 @@ class SysTestMon():
             output.extend(line)
         stdout.close()
         stderro.close()
-
-        # self.logger.info("Executing on {0}: {1}".format(hostname, command))
-        # ssh_stdin, ssh_stdout, ssh_stderr = ssh.exec_command(command)
-
-        # output = ""
-        # while not ssh_stdout.channel.exit_status_ready():
-        #    # Only print data if there is data to read in the channel
-        #    if ssh_stdout.channel.recv_ready():
-        #        rl, wl, xl = select.select([ssh_stdout.channel], [], [], 0.0)
-        #        if len(rl) > 0:
-        #            tmp = ssh_stdout.channel.recv(1024)
-        #            output += tmp.decode()
-
-        # output = output.split("\n")
-
         ssh.close()
-
-        # return len(output) - 1, output, ssh_stderr
         return len(output), output, error
 
 
+def configure_logger():
+    # Logging configuration
+    Globals.logger.setLevel(logging.DEBUG)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    ch.setFormatter(formatter)
+    Globals.logger.addHandler(ch)
+    timestamp = str(datetime.now().strftime('%Y%m%dT_%H%M%S'))
+    fh = logging.FileHandler("./systestmon-{0}.log".format(timestamp))
+    fh.setFormatter(formatter)
+    Globals.logger.addHandler(fh)
+
+    # Set Paramiko logger
+    paramiko.util.log_to_file('./paramiko.log')
+
+
 if __name__ == '__main__':
-    master_node = sys.argv[1]
-    rest_username = sys.argv[2]
-    rest_password = sys.argv[3]
-    ssh_username = sys.argv[4]
-    ssh_password = sys.argv[5]
-    cbcollect_on_high_mem_cpu_usage = sys.argv[6]
-    print_all_logs = sys.argv[7]
-    email_recipients = sys.argv[8]
-    state_file_dir = sys.argv[9]
-    run_infinite = sys.argv[10]
-    logger = ast.literal_eval(sys.argv[11])
-    should_collect_dumps = sys.argv[12]
-    docker_host = sys.argv[13]
-    try:
-        cb_host = sys.argv[14]
-    except IndexError:
-        cb_host = "172.23.104.178"
-    SysTestMon().run(master_node, rest_username, rest_password, ssh_username, ssh_password,
-                     cbcollect_on_high_mem_cpu_usage, print_all_logs, email_recipients, state_file_dir, run_infinite,
-                     logger, should_collect_dumps, docker_host, cb_host)
+    parser = argparse.ArgumentParser(description='Run CB monitoring script')
+    # Below are required args
+    parser.add_argument('master_node', type=str,
+                        help='IP of the master node for reference')
+    parser.add_argument('rest_username', type=str,
+                        help='Cluster REST username')
+    parser.add_argument('rest_password', type=str,
+                        help='Cluster REST password')
+    parser.add_argument('ssh_username', type=str, help='SSH username')
+    parser.add_argument('ssh_password', type=str, help='SSH password')
+    parser.add_argument("email_recipients", type=str,
+                        help="Comma separated list")
+    parser.add_argument("state_file_dir", default="./",
+                        help="Dir to store the state files")
+    parser.add_argument("docker_host", default=None, help="Docker host")
+
+    # Optional args
+    parser.add_argument("--cb_host", default="172.23.104.178",
+                        help="CB host for SDK connection")
+
+    # Flags
+    parser.add_argument("--cbcollect_on_high_mem_cpu_usage",
+                        action="store_true", default=False,
+                        help="Collect cb-logs during high mem/cpu usage")
+    parser.add_argument("--print_all_logs", action="store_true",
+                        default=False, help="Prints all logs")
+    parser.add_argument("--run_infinite", action="store_true", default=False,
+                        help="Flag to enable infinite log collection loops")
+    parser.add_argument("--collect_dumps", action="store_true",
+                        default=False, help="Flag to enable collection dumps")
+    args = parser.parse_args()
+    # End of command line options parsing
+
+    # Configure log handlers
+    configure_logger()
+
+    # Set common configurations from cmd options
+    ScriptConfig.cbcollect_on_high_mem_cpu_usage = args.cbcollect_on_high_mem_cpu_usage
+    ScriptConfig.print_all_logs = args.print_all_logs
+    ScriptConfig.email_recipients = args.email_recipients
+    ScriptConfig.should_collect_dumps = args.collect_dumps
+    ScriptConfig.docker_host = args.docker_host
+    ScriptConfig.state_file_dir = args.state_file_dir
+
+    Globals.sdk_client = SDKClient(args.cb_host)
+
+    # Create cluster object for managing purpose
+    main_cluster = CBCluster(args.master_node,
+                             args.rest_username, args.rest_password,
+                             args.ssh_username, args.ssh_password)
+
+    # Create monitoring object and start monitoring
+    main_sys_mon = SysTestMon(main_cluster, args.run_infinite)
+    main_sys_mon.run()
