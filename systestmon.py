@@ -3,6 +3,8 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta
+from threading import Thread
+
 import httplib2
 import traceback
 import socket
@@ -238,6 +240,7 @@ class ScriptConfig(object):
     print_all_logs = False
     should_collect_dumps = False
     cbcollect_on_high_mem_cpu_usage = False
+    scan_xdcr_destination = False
 
     docker_host = None
     email_recipients = ""
@@ -277,6 +280,7 @@ class SysTestMon(object):
     def run(self):
         self.wait_for_cluster_init(self.cluster.master_node)
         last_scan_timestamp = ""
+        xdcr_monitor_threads = list()
         while True:
             msg_sub = ""
             msg_content = ""
@@ -298,6 +302,21 @@ class SysTestMon(object):
                                              self.cluster.rest_password)
             if not node_map:
                 continue
+
+            if ScriptConfig.scan_xdcr_destination:
+                for xdcr_ip in self.get_xdcr_dest(self.cluster.master_node):
+                    self.logger.info("Starting XDCR log collection for {}"
+                                     .format(xdcr_ip))
+                    xdcr_cluster = CBCluster(
+                        xdcr_ip,
+                        self.cluster.rest_username, self.cluster.rest_password,
+                        self.cluster.ssh_username, self.cluster.ssh_password)
+                    t_sysmon_obj = SysTestMon(xdcr_cluster, False,
+                                              start_itr=self.iter_count)
+                    t_thread = Thread(name="XDCR_{}_thread".format(xdcr_ip),
+                                      target=t_sysmon_obj.run)
+                    xdcr_monitor_threads.append(t_thread)
+                    t_thread.start()
 
             for component in Configuration.configuration:
                 nodes = self.find_nodes_with_service(node_map,
@@ -570,6 +589,10 @@ class SysTestMon(object):
                     Globals.sdk_client.store_results(msg_sub, msg_content)
                 except Exception:
                     pass
+
+            if ScriptConfig.scan_xdcr_destination:
+                for t_thread in xdcr_monitor_threads:
+                    t_thread.join(1800)
 
             if not self.run_infinite:
                 break
@@ -947,14 +970,13 @@ class SysTestMon(object):
         api = "http://" + node + ":8091/pools/default/remoteClusters"
         status, content, _ = self._http_request(api)
         content_array = json.loads(content)
-        xdcr_dest_master_ip = []
+        xdcr_dest_master_ip = list()
         for content in content_array:
             if 'hostname' in content:
                 xdcr_dest_ip = content['hostname']
                 xdcr_dest_master_ip.append(xdcr_dest_ip.split(':')[0])
-        if len(xdcr_dest_master_ip) == 0 :
-            self.logger.info("destination ip not found")
-            return None
+        if len(xdcr_dest_master_ip) == 0:
+            self.logger.info("No XDCR destinations found!")
         return xdcr_dest_master_ip
 
     def get_xdcr_src_buckets(self, node):
@@ -1203,6 +1225,8 @@ if __name__ == '__main__':
                         help="Flag to enable infinite log collection loops")
     parser.add_argument("--collect_dumps", action="store_true",
                         default=False, help="Flag to enable collection dumps")
+    parser.add_argument("--scan_xdcr_destination", action="store_true",
+                        default=False, help="Log-monitor XDCR connections")
     args = parser.parse_args()
     # End of command line options parsing
 
@@ -1216,6 +1240,7 @@ if __name__ == '__main__':
     ScriptConfig.should_collect_dumps = args.collect_dumps
     ScriptConfig.docker_host = args.docker_host
     ScriptConfig.state_file_dir = args.state_file_dir
+    ScriptConfig.scan_xdcr_destination = args.scan_xdcr_destination
 
     Globals.sdk_client = SDKClient(args.cb_host)
 
