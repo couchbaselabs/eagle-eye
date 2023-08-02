@@ -248,14 +248,15 @@ class ScriptConfig(object):
 
 
 class CBCluster(object):
-    def __init__(self, master_node, rest_username, rest_password,
+    def __init__(self, cluster_name, master_node, rest_username, rest_password,
                  ssh_username, ssh_password):
+        self.cluster_name = cluster_name
         self.master_node = master_node
         self.rest_username = rest_username
         self.rest_password = rest_password
         self.ssh_username = ssh_username
         self.ssh_password = ssh_password
-        
+
 
 class SysTestMon(object):
     # 1. Get service map for cluster
@@ -276,6 +277,20 @@ class SysTestMon(object):
         self.dump_dir_name = ""
         self.docker_logs_dump = ""
         self.iter_count = start_itr
+        self.token = None
+
+    @staticmethod
+    def append_msg_string(msg_text, file_text, msg_to_append):
+        truncated = False
+        file_text = file_text + msg_to_append
+        msg_to_append = msg_to_append.split("\n")
+        if len(msg_to_append) > 11:
+            truncated = True
+            msg_to_append = msg_to_append[:10]
+        msg_to_append = "\n".join(msg_to_append)
+        msg_to_append += "...[truncated]\n" if truncated else "\n"
+        msg_text = msg_text + msg_to_append
+        return msg_text, file_text
 
     def run(self):
         self.wait_for_cluster_init(self.cluster.master_node)
@@ -284,9 +299,12 @@ class SysTestMon(object):
         while True:
             msg_sub = ""
             msg_content = ""
+            file_content = ""
             should_cbcollect = False
             prev_keyword_counts = None
             self.dump_dir_name = "dump_collected_{}".format(self.iter_count)
+            # Used to identify the current itr uniquely
+            self.token = int(time.time())
 
             if os.path.exists(self.state_file):
                 s = open(self.state_file, 'r').read()
@@ -304,11 +322,11 @@ class SysTestMon(object):
                 continue
 
             if ScriptConfig.scan_xdcr_destination:
-                for xdcr_ip in self.get_xdcr_dest(self.cluster.master_node):
+                for x_index, xdcr_ip in enumerate(self.get_xdcr_dest(self.cluster.master_node)):
                     self.logger.info("Starting XDCR log collection for {}"
                                      .format(xdcr_ip))
                     xdcr_cluster = CBCluster(
-                        xdcr_ip,
+                        "xdcr_cluster_%s" % x_index, xdcr_ip,
                         self.cluster.rest_username, self.cluster.rest_password,
                         self.cluster.ssh_username, self.cluster.ssh_password)
                     t_sysmon_obj = SysTestMon(xdcr_cluster, False,
@@ -321,16 +339,18 @@ class SysTestMon(object):
             for component in Configuration.configuration:
                 nodes = self.find_nodes_with_service(node_map,
                                                      component["services"])
-                self.logger.info("{} - Nodes with {} service : {}"
+                self.logger.info("{} ({}) - Nodes with {} service : {}"
                                  .format(self.cluster.master_node,
+                                         self.cluster.cluster_name,
                                          component["services"], str(nodes)))
                 for keyword in component["keywords"]:
                     key = component["component"] + "_" + keyword
                     self.logger.info(
-                        "{} - Parsing for component: {}, looking for '{}'"
+                        "{} ({}) - Parsing for component: {}, looking for '{}'"
                         .format(self.cluster.master_node,
+                                self.cluster.cluster_name,
                                 component["component"], keyword))
-                    total_occurences = 0
+                    total_occurrences = 0
 
                     for node in nodes:
                         if component["ignore_keywords"]:
@@ -346,61 +366,69 @@ class SysTestMon(object):
                                 self.cluster.ssh_password)
                         except Exception as e:
                             self.logger.info("Exception {0}".format(e))
-                            msg_content = msg_content + '\n\n' + node \
-                                          + " : " + str(component["component"])
-                            msg_content = \
-                                msg_content + '\n\n' \
-                                + "Found an exception {0}".format(e) + "\n"
+
+                            txt = '\n\n%s: %s\n\n ' \
+                                  'Found an exception: %s' \
+                                  % (node, component["component"], e)
+                            msg_content, file_content = \
+                                self.append_msg_string(msg_content,
+                                                       file_content, txt)
                         if occurences > 0:
                             self.logger.warning(
-                                "Node {} - {} occurences of {} keyword found"
+                                "{} - {} occurrences of keyword '{}' found"
                                 .format(node, occurences, keyword))
-                            msg_content = msg_content + '\n\n' + node + " : " + str(component["component"])
+                            txt = "\n\n%s: %s" % (node, component["component"])
                             if ScriptConfig.print_all_logs \
                                     or last_scan_timestamp == "":
-                                self.logger.debug('\n'.join(output))
                                 try:
-                                    msg_content = msg_content + '\n' \
-                                                  + '\n'.join(output)
+                                    self.logger.debug('\n'.join(output))
+                                    txt += "\n%s" % ('\n'.join(output))
                                 except UnicodeDecodeError as e:
                                     self.logger.warning(str(e))
-                                    msg_content = msg_content + '\n' + '\n'.join(output).decode("utf-8")
+                                    txt += "\n%s" % ('\n'.join(output)
+                                                     .decode("utf-8"))
                             else:
-                                msg_content = self.print_output(output, last_scan_timestamp, msg_content)
-                            # for i in range(len(output)):
-                            #    self.logger.info(output[i])
-                        total_occurences += occurences
+                                txt = self.print_output(output, last_scan_timestamp, txt)
+                            msg_content, file_content = \
+                                self.append_msg_string(msg_content,
+                                                       file_content, txt)
+                        total_occurrences += occurences
 
-                    self.keyword_counts[key] = total_occurences
+                    self.keyword_counts[key] = total_occurrences
                     if prev_keyword_counts is not None \
                             and key in prev_keyword_counts.keys():
-                        if total_occurences > int(prev_keyword_counts[key]):
+                        if total_occurrences > int(prev_keyword_counts[key]):
                             self.logger.warning(
                                 "There have been more occurences of keyword {0} "
                                 "in the logs since the last iteration. Hence "
                                 "performing a cbcollect.".format(keyword))
                             should_cbcollect = True
                     else:
-                        if total_occurences > 0:
+                        if total_occurrences > 0:
                             should_cbcollect = True
 
                 for node in nodes:
                     if component["check_stats_api"]:
-                        msg_content = msg_content + '\n\n' + node + " : " + str(component["component"])
+                        txt = '\n\n%s: %s' % (node, component["component"])
                         try:
-                            fin_neg_stat, msg_content = self.check_stats_api(node, component, msg_content)
+                            fin_neg_stat, txt = self.check_stats_api(node, component, txt)
                             if fin_neg_stat.__len__() != 0:
                                 should_cbcollect = True
                         except Exception as e:
                             self.logger.info("Found an exception {0}".format(e))
+                        msg_content, file_content = \
+                            self.append_msg_string(msg_content,
+                                                   file_content, txt)
 
                     if component["collect_dumps"] and ScriptConfig.should_collect_dumps:
-                        msg_content = msg_content + '\n\n' + node + " : " + str(
-                            component["component"]) + " Collecting dumps"
+                        txt = '\n\n%s: %s collecting dumps' % (node, component["component"])
                         try:
-                            msg_content = self.collect_dumps(node, component, msg_content)
+                            txt = self.collect_dumps(node, component, txt)
                         except Exception as e:
                             self.logger.info("Found an exception {0}".format(e))
+                        msg_content, file_content = \
+                            self.append_msg_string(msg_content,
+                                                   file_content, txt)
 
                 # Check if all n1ql nodes are healthy
                 if component["component"] == "query":
@@ -417,8 +445,11 @@ class SysTestMon(object):
                         if should_collect:
                             should_cbcollect = True
                         if not message == '':
-                            msg_content = msg_content + '\n\n' + node + " : " + str(component["component"])
-                            msg_content = msg_content + '\n\n' + message + "\n"
+                            txt = '\n\n%s: %s\n\n%s\n' \
+                                  % (node, component["component"], message)
+                            msg_content, file_content = \
+                                self.append_msg_string(msg_content,
+                                                       file_content, txt)
                         # Check system:completed_requests for errors
                         self.logger.info("Checking system:completed requests for errors")
                         should_collect, message = self.check_completed_requests(
@@ -430,8 +461,11 @@ class SysTestMon(object):
                         if should_collect:
                             should_cbcollect = True
                         if not message == '':
-                            msg_content = msg_content + '\n\n' + node + " : " + str(component["component"])
-                            msg_content = msg_content + '\n\n' + message + "\n"
+                            txt = '\n\n%s: %s\n\n%s\n' \
+                                  % (node, component["component"], message)
+                            msg_content, file_content = \
+                                self.append_msg_string(msg_content,
+                                                       file_content, txt)
                         # Check active_requests to make sure that are no more than 1k active requests at a single time
                         self.logger.info("Checking system:active requests for too many requests")
                         should_collect, message = self.check_active_requests(
@@ -443,8 +477,11 @@ class SysTestMon(object):
                         if should_collect:
                             should_cbcollect = True
                         if not message == '':
-                            msg_content = msg_content + '\n\n' + node + " : " + str(component["component"])
-                            msg_content = msg_content + '\n\n' + message + "\n"
+                            txt = '\n\n%s: %s\n\n%s\n' \
+                                  % (node, component["component"], message)
+                            msg_content, file_content = \
+                                self.append_msg_string(msg_content,
+                                                       file_content, txt)
 
                 # # Check if XDCR outgoing mutations in the past hour > threshold
                 # if component["component"] == "xdcr":
@@ -509,28 +546,34 @@ class SysTestMon(object):
                             scp.get(file, local_path=self.docker_logs_dump)
 
                     docker_logs_location = "{0}/{1}".format(os.getcwd(), self.docker_logs_dump)
-                    msg_content = msg_content + '\n\n Docker logs collected at: ' + docker_logs_location
+                    txt = "\n\nDocker logs collected at: %s" % docker_logs_location
+                    msg_content, file_content = \
+                        self.append_msg_string(msg_content,
+                                               file_content, txt)
                     self.logger.info("Collecting all docker logs completed. "
                                      "Docker logs at : {0}"
                                      .format(docker_logs_location))
                 except Exception as e:
-                    self.logger.info("Could not collect docker logs: {0}".format(str(e)))
+                    self.logger.info("Could not collect docker logs: %s" % e)
 
             collected = False
+            cbcollect_urls = ""
             start_time = time.time()
+            time_out_val = start_time + 3600
 
             while should_cbcollect and not collected \
-                    and time.time() < (start_time + (60 * 60)):
-                self.logger.info("{} :: RUNNING CBCOLLECT_INFO"
-                                 .format(self.cluster.master_node))
-                epoch_time = int(time.time())
-                command = "/opt/couchbase/bin/couchbase-cli collect-logs-start " \
-                          "-c {0} -u {1} -p {2} --all-nodes --upload " \
-                          "--upload-host cb-jira.s3.us-east-2.amazonaws.com/logs " \
-                          "--customer systestmon-{3}"\
-                          .format(self.cluster.master_node,
-                                  self.cluster.rest_username,
-                                  self.cluster.rest_password, epoch_time)
+                    and time.time() < time_out_val:
+                self.logger.info("{} ({}) :: Running cbcollect_info"
+                                 .format(self.cluster.master_node,
+                                         self.cluster.cluster_name))
+                command = \
+                    "/opt/couchbase/bin/couchbase-cli collect-logs-start " \
+                    "-c {0} -u {1} -p {2} --all-nodes --upload " \
+                    "--upload-host cb-jira.s3.us-east-2.amazonaws.com/logs " \
+                    "--customer systestmon-{3}"\
+                    .format(self.cluster.master_node,
+                            self.cluster.rest_username,
+                            self.cluster.rest_password, self.token)
                 _, cbcollect_output, std_err = self.execute_command(
                     command, self.cluster.master_node,
                     self.cluster.ssh_username, self.cluster.ssh_password)
@@ -542,53 +585,63 @@ class SysTestMon(object):
                         self.logger.info(cbcollect_output[i])
 
                 while True:
-                    command = "/opt/couchbase/bin/couchbase-cli collect-logs-status -c {0} -u {1} -p {2}".format(
-                        self.cluster.master_node,
-                        self.cluster.rest_username, self.cluster.rest_password)
+                    command = "/opt/couchbase/bin/couchbase-cli " \
+                        "collect-logs-status -c {0} -u {1} -p {2}"\
+                        .format(self.cluster.master_node,
+                                self.cluster.rest_username,
+                                self.cluster.rest_password)
                     _, cbcollect_output, std_err = self.execute_command(
                         command, self.cluster.master_node,
                         self.cluster.ssh_username, self.cluster.ssh_password)
                     if std_err:
-                        self.logger.error("Error while running cbcollect_info")
-                        self.logger.info(std_err)
+                        self.logger.error("cbcollect_info error: %s" % std_err)
                         break
                     else:
-                        if cbcollect_output[0] == "Status: completed":
-                            cbcollect_upload_paths = []
+                        if cbcollect_output[0] == "Status: running":
+                            time.sleep(60)
+                        elif cbcollect_output[0] == "Status: completed":
+                            collected = True
+                            cbcollect_upload_paths = list()
                             for line in cbcollect_output:
                                 if "url :" in line:
                                     cbcollect_upload_paths.append(line)
-                            self.logger.info("cbcollect upload paths : \n")
-                            self.logger.info('\n'.join(cbcollect_upload_paths))
-                            msg_content = \
-                                msg_content + \
-                                '\n\ncbcollect logs: \n\n' + '\n'.join(
-                                    cbcollect_upload_paths)
-                            collected = True
+                            cbcollect_urls = "\nCbcollect logs:\n\n%s" \
+                                % ('\n'.join(cbcollect_upload_paths))
+                            self.logger.info(cbcollect_urls)
                             break
-                        elif cbcollect_output[0] == "Status: running":
-                            time.sleep(60)
                         elif cbcollect_output[0] == "Status: cancelled":
                             collected = False
+                            cbcollect_upload_paths = list()
+                            for line in cbcollect_output:
+                                if "url :" in line:
+                                    cbcollect_upload_paths.append(line)
+                            cbcollect_urls = "\nCbcollect logs:\n\n%s" \
+                                % ('\n'.join(cbcollect_upload_paths))
+                            self.logger.info(cbcollect_urls)
                             break
                         else:
-                            self.logger.error("Issue with cbcollect")
+                            self.logger.error("Issue with cbcollect: %s"
+                                              % cbcollect_output)
                             break
             self.update_state_file()
 
-            self.logger.info(
-                "====== Log scan iteration number {0} complete"
-                "======".format(self.iter_count))
-            msg_sub = msg_sub.join(
-                "Node: {0} : Log scan iteration number {1} complete"
-                .format(self.cluster.master_node, self.iter_count))
+            txt = "{} ({}): Log scan iteration number {} complete" \
+                .format(self.cluster.master_node,
+                        self.cluster.cluster_name, self.iter_count)
+            msg_sub = msg_sub.join(txt)
             if should_cbcollect:
-                self.send_email(msg_sub, msg_content,
-                                ScriptConfig.email_recipients)
+                try:
+                    msg_content += cbcollect_urls
+                    file_content += cbcollect_urls
+                    self.send_email(msg_sub, ScriptConfig.email_recipients,
+                                    msg_content, file_content)
+                except Exception as e:
+                    self.logger.critical("Send mail exception: %s" % e)
                 try:
                     Globals.sdk_client.store_results(msg_sub, msg_content)
                 except Exception:
                     pass
+            self.logger.info("========== %s ==========" % txt)
 
             if ScriptConfig.scan_xdcr_destination:
                 for t_thread in xdcr_monitor_threads:
@@ -641,29 +694,45 @@ class SysTestMon(object):
             for i in range(len(df_output)):
                 self.logger.info(df_output[i])
 
-    def send_email(self, msg_sub, msg_content, email_recipients):
-        SENDMAIL = "/usr/sbin/sendmail"  # sendmail location
-        FROM = "eagle-eye@couchbase.com"
-        TO = email_recipients
-        SUBJECT = msg_sub
-        TEXT = msg_content
+    def send_email(self, msg_sub, email_recipients, msg_content, file_content):
+        attachment = ""
+        mail_from = "Eagle-Eye<eagle-eye@couchbase.com>"
+        t_file_prefix = "/tmp/iter_{}_{}_{}"\
+            .format(self.iter_count, self.cluster.master_node, self.token)
 
-        # Prepare actual message
-        msg = ('From: %s\n'
-               'To: %s\n'
-               'Subject: %s\n'
-               '\n'
-               '%s\n') % (FROM, TO, SUBJECT, TEXT)
+        # Dump the email body to file
+        with open("{}_body.log".format(t_file_prefix), "w") as fp:
+            fp.write(msg_content.strip())
 
-        # Send the mail
-        p = os.popen("%s -t -i" % SENDMAIL, "w")
-        try:
-            p.write(msg)
-        except UnicodeEncodeError as e:
-            self.logger.warning(str(e))
-            p.write(msg.encode("utf-8"))
+        if file_content:
+            # Dump full logs into file for attachment
+            with open("{}.log".format(t_file_prefix), "w") as fp:
+                fp.write(file_content.strip())
+
+            # Zip the logs to compress
+            p = os.popen("zip -jFSr {0}.zip {0}.log".format(t_file_prefix))
+            status = p.close()
+            if status:
+                self.logger.info("Zip status: {}".format(status))
+
+            attachment = "-a \"{0}.zip\"".format(t_file_prefix)
+
+        # Send mail
+        cmd = "mailx -s \"{}\" {} -r \"{}\" \"{}\" < \"{}_body.log\"" \
+              .format(msg_sub, attachment, mail_from,
+                      email_recipients, t_file_prefix)
+        self.logger.info("Sending mail: %s" % cmd)
+        p = os.popen(cmd)
         status = p.close()
-        self.logger.info("Sendmail exit status: {}".format(status))
+        if status:
+            self.logger.info("Sendmail exit status: {}".format(status))
+
+        # Cleanup tmp files only if mail sent
+        if status is None:
+            p = os.popen("rm -f {}*".format(t_file_prefix))
+            status = p.close()
+            if status:
+                self.logger.info("Del .log file status: {}".format(status))
 
     def update_state_file(self):
         target = open(self.state_file, 'w')
@@ -1041,7 +1110,7 @@ class SysTestMon(object):
                 if count < 4:
                     self.logger.error("socket error while connecting to {0} error {1} ".format(api, e))
                 if time.time() > end_time:
-                    self.logger.error("Tried ta connect {0} times".format(count))
+                    self.logger.error("Tried to connect {0} times".format(count))
                     raise Exception()
             except httplib2.ServerNotFoundError as e:
                 if count < 4:
@@ -1245,7 +1314,7 @@ if __name__ == '__main__':
     Globals.sdk_client = SDKClient(args.cb_host)
 
     # Create cluster object for managing purpose
-    main_cluster = CBCluster(args.master_node,
+    main_cluster = CBCluster("Main_cluster", args.master_node,
                              args.rest_username, args.rest_password,
                              args.ssh_username, args.ssh_password)
 
