@@ -520,8 +520,14 @@ class SysTestMon(object):
                         .format(node["hostname"], node["status"]))
                     if ScriptConfig.cbcollect_on_high_mem_cpu_usage:
                         should_cbcollect = True
-                # self.check_on_ntp_status(node["hostname"])
-                self.check_on_disk_usage(node["hostname"])
+
+                # Check NTP status
+                # command = "timedatectl status | grep NTP"
+                # self.record_command_output(node["hostname"], command)
+
+                # Check disk usage
+                command = "df -kh /data"
+                self.record_command_output(node["hostname"], command)
 
             last_scan_timestamp = datetime.now() - timedelta(minutes=10.0)
             self.logger.info("Last scan timestamp:" + str(last_scan_timestamp))
@@ -668,31 +674,20 @@ class SysTestMon(object):
                        timeout=120, banner_timeout=120)
         return client
 
-    def check_on_disk_usage(self, node):
-        self.logger.info("{} :: check_on_disk_usage".format(node))
-        command = "df -kh /data"
-        _, df_output, std_err = self.execute_command(
-            command, node, self.cluster.ssh_username,
-            self.cluster.ssh_password)
-        if std_err:
-            self.logger.error("Error seen while running df -kh ")
-            self.logger.info(std_err)
-        else:
-            for i in range(len(df_output)):
-                self.logger.info(df_output[i])
-
-    def check_on_ntp_status(self, node):
-        self.logger.info("{} :: check_on_ntp_status".format(node))
-        command = "timedatectl status | grep NTP"
-        _, df_output, std_err = self.execute_command(
-            command, node, self.cluster.ssh_username,
-            self.cluster.ssh_password)
-        if std_err:
-            self.logger.error("Error seen while running df -kh ")
-            self.logger.info(std_err)
-        else:
-            for i in range(len(df_output)):
-                self.logger.info(df_output[i])
+    def record_command_output(self, node, command):
+        self.logger.info("{} :: Running '{}'".format(node, command))
+        try:
+            _, df_output, std_err = self.execute_command(
+                command, node, self.cluster.ssh_username,
+                self.cluster.ssh_password)
+            if std_err:
+                self.logger.error("std error while running '%s': %s"
+                                  % (command, std_err))
+            else:
+                for i in range(len(df_output)):
+                    self.logger.info(df_output[i])
+        except Exception as e:
+            self.logger.error(e)
 
     def send_email(self, msg_sub, email_recipients, msg_content, file_content):
         attachment = ""
