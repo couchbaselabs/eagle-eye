@@ -128,7 +128,7 @@ class Configuration(object):
             "component": "eventing",
             "logfiles": "eventing.log*",
             "services": "eventing",
-            "keywords": ["panic", "fatal", "Basic\s[a-zA-Z]\{10,\}", "Menelaus-Auth-User:\["],
+            "keywords": ["panic", "fatal", "Basic\s[a-zA-Z]\{10,\}", "Menelaus-Auth-User:\[", "Minidump"],
             "ignore_keywords": None,
             "check_stats_api": False,
             "collect_dumps": False
