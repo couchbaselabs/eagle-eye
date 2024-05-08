@@ -199,7 +199,7 @@ class Configuration(object):
             "logfiles": "query.log*",
             "services": "n1ql",
             "keywords": ["panic", "fatal", "Encounter planner error", "Basic\s[a-zA-Z]\{10,\}",
-                         "Menelaus-Auth-User:\[", "invalid byte in chunk length"],
+                         "Menelaus-Auth-User:\[", "invalid byte in chunk length", "Minidump"],
             "ignore_keywords": ["not available"],
             "check_stats_api": False,
             "collect_dumps": True,
