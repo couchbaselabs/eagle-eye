@@ -119,7 +119,7 @@ class Configuration(object):
             "services": "cbas",
             "keywords": ["fata", "Analytics Service is temporarily unavailable", "Failed during startup task", "HYR0",
                          "ASX", "IllegalStateException", "Basic\s[a-zA-Z]\{10,\}", "Menelaus-Auth-User:\[", "panic", "LEAK: ByteBuf.release() was not called",
-                         "failed to migrate metadata partition"],
+                         "failed to migrate metadata partition", "Internal error", "CBAS\[number\]", "IllegalReferenceCountException", "ArrayIndexOutOfBoundsException"],
             "ignore_keywords": ["HYR0010","HYR0115","ASX3110","HYR0114"],
             "check_stats_api": False,
             "collect_dumps": False
