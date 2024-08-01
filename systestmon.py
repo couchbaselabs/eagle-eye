@@ -103,7 +103,7 @@ class Configuration(object):
                          "corruption", "processFlushAbort", "Basic\s[a-zA-Z]\{10,\}", "Menelaus-Auth-User:\[",
                          "Failed to initialize metadata provider", "found missing page", "invalid last page",
                          "Storage corrupted and unrecoverable", "ensureMonotonicTs  Align seqno smaller than lastFlushTs",
-                         "TS falls out of snapshot boundary", "invalid length of composite element filters in scan request",
+                         "invalid length of composite element filters in scan request",
                          "Internal error while creating new scan request", "StorageMgr::handleCreateSnapshot Disk commit timestamp is not snapshot aligned",
                          "ReplicaViolation", "ExcludeNodeViolation", "EquivIndexViolation", "ServerGroupViolation", "DeleteNodeViolation",
                          "NoViolation", "MemoryViolation", "NumVbs out of valid range"],
@@ -119,7 +119,8 @@ class Configuration(object):
             "services": "cbas",
             "keywords": ["fata", "Analytics Service is temporarily unavailable", "Failed during startup task", "HYR0",
                          "ASX", "IllegalStateException", "Basic\s[a-zA-Z]\{10,\}", "Menelaus-Auth-User:\[", "panic", "LEAK: ByteBuf.release() was not called",
-                         "failed to migrate metadata partition", "Internal error", "CBAS\[number\]", "IllegalReferenceCountException", "ArrayIndexOutOfBoundsException"],
+                         "failed to migrate metadata partition", "Internal error", "CBAS\[number\]", "IllegalReferenceCountException", "ArrayIndexOutOfBoundsException",
+                         "ACIDException", "MetadataException", "OverflowException", "UnderflowException", "NullPointerException", "StackOverflowException", "Failure closing a closeable resource"],
             "ignore_keywords": ["HYR0010","HYR0115","ASX3110","HYR0114"],
             "check_stats_api": False,
             "collect_dumps": False
