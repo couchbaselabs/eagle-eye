@@ -106,7 +106,8 @@ class Configuration(object):
                          "invalid length of composite element filters in scan request",
                          "Internal error while creating new scan request", "StorageMgr::handleCreateSnapshot Disk commit timestamp is not snapshot aligned",
                          "ReplicaViolation", "ExcludeNodeViolation", "EquivIndexViolation", "ServerGroupViolation", "DeleteNodeViolation",
-                         "NoViolation", "MemoryViolation", "NumVbs out of valid range"],
+                         "NoViolation", "MemoryViolation", "NumVbs out of valid range", "Skipped disk snapshot cleanup",
+                         "Unable to find recovery point. Resetting store"],
             "ignore_keywords": ["fatal remote"],
             "check_stats_api": True,
             "stats_api_list": ["stats/storage", "stats"],
@@ -586,10 +587,10 @@ class SysTestMon(object):
                     "/opt/couchbase/bin/couchbase-cli collect-logs-start " \
                     "-c {0} -u {1} -p {2} --all-nodes --upload " \
                     "--upload-host cb-jira.s3.us-east-2.amazonaws.com/logs " \
-                    "--customer systestmon-{3}"\
+                    "--customer systestmon-iteration-{3}-{4}"\
                     .format(self.cluster.master_node,
                             self.cluster.rest_username,
-                            self.cluster.rest_password, self.token)
+                            self.cluster.rest_password, self.iter_count, self.token)
                 _, cbcollect_output, std_err = self.execute_command(
                     command, self.cluster.master_node,
                     self.cluster.ssh_username, self.cluster.ssh_password)
