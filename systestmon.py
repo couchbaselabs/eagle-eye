@@ -270,6 +270,7 @@ class SysTestMon(object):
     def __init__(self, cluster, run_infinite, start_itr=1):
         self.logger = Globals.logger
         self.cluster = cluster
+        self.cb_version = ""
         self.run_infinite = run_infinite
         self.state_file = "{}/eagle-eye_{}.state" \
             .format(ScriptConfig.state_file_dir, cluster.master_node)
@@ -299,6 +300,12 @@ class SysTestMon(object):
         self.wait_for_cluster_init(self.cluster.master_node)
         last_scan_timestamp = ""
         xdcr_monitor_threads = list()
+        try:
+            cmd = "/opt/couchbase/bin/couchbase-server --version"
+            _,  self.cb_version, std_err = self.execute_command(
+                cmd, self.cluster.master_node,  self.cluster.ssh_username, self.cluster.ssh_password)
+        except Exception:
+            pass
         while True:
             msg_sub = ""
             msg_content = ""
@@ -634,9 +641,10 @@ class SysTestMon(object):
                             break
             self.update_state_file()
 
-            txt = "{} ({}): Log scan iteration number {} complete" \
+            txt = "{} ({}) : {} Log scan iteration number {} complete" \
                 .format(self.cluster.master_node,
-                        self.cluster.cluster_name, self.iter_count)
+                        self.cluster.cluster_name, self.cb_version,
+                        self.iter_count)
             msg_sub = msg_sub.join(txt)
             if should_cbcollect:
                 try:
