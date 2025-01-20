@@ -159,7 +159,7 @@ class Configuration(object):
                          "has payloadCompressed but no payload after deserialization",
                          "Error converting VBTask to DCP Nozzle Task",
                          "Xmem is stuck"],
-            "ignore_keywords": None,
+            "ignore_keywords": ["Errors\": \"[]"],
             "check_stats_api": False,
             "collect_dumps": False,
             "outgoing_mutations_threshold": 1000000
