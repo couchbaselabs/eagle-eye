@@ -109,7 +109,7 @@ class Configuration(object):
                          "NoViolation", "MemoryViolation", "NumVbs out of valid range", "Skipped disk snapshot cleanup"],
             "ignore_keywords": ["fatal remote"],
             "check_stats_api": True,
-            "stats_api_list": ["stats/storage", "stats"],
+            "stats_api_list": ["stats", "stats/storage"],
             "port": "9102",
             "collect_dumps": True
         },
@@ -347,6 +347,9 @@ class SysTestMon(object):
                     t_thread.start()
 
             for component in Configuration.configuration:
+                # Skip XDCR component check if scan_xdcr_destination is not set
+                if component["component"] == "xdcr" and not ScriptConfig.scan_xdcr_destination:
+                    continue
                 nodes = self.find_nodes_with_service(node_map,
                                                      component["services"])
                 self.logger.info("{} ({}) - Nodes with {} service : {}"
@@ -364,10 +367,10 @@ class SysTestMon(object):
 
                     for node in nodes:
                         if component["ignore_keywords"]:
-                            command = "zgrep -i \"{0}\" /opt/couchbase/var/lib/couchbase/logs/{1} | grep -vE \"{2}\"".format(
+                            command = "zgrep --text -i \"{0}\" /opt/couchbase/var/lib/couchbase/logs/{1} | grep -vE \"{2}\"".format(
                                 keyword, component["logfiles"], "|".join(component["ignore_keywords"]))
                         else:
-                            command = "zgrep -i \"{0}\" /opt/couchbase/var/lib/couchbase/logs/{1}".format(
+                            command = "zgrep --text -i \"{0}\" /opt/couchbase/var/lib/couchbase/logs/{1}".format(
                                 keyword, component["logfiles"])
                         occurences = 0
                         try:
@@ -640,11 +643,12 @@ class SysTestMon(object):
                                               % cbcollect_output)
                             break
             self.update_state_file()
-
-            txt = "{} ({}) : {} Log scan iteration number {} complete" \
+            latest_timestamp = "placeholder_for_timestamp"
+            latest_timestamp = self.get_latest_debug_log_timestamp(self.cluster.master_node)
+            txt = "{} ({}) : {} Log scan iteration number {} complete until timestamp {}" \
                 .format(self.cluster.master_node,
                         self.cluster.cluster_name, self.cb_version,
-                        self.iter_count)
+                        self.iter_count, latest_timestamp)
             msg_sub = msg_sub.join(txt)
             if should_cbcollect:
                 try:
@@ -706,12 +710,16 @@ class SysTestMon(object):
         t_file_prefix = "/tmp/iter_{}_{}_{}"\
             .format(self.iter_count, self.cluster.master_node, self.token)
 
-        # Dump the email body to file
+        # Ensure content is encoded as UTF-8
+        msg_content = msg_content.encode('utf-8', errors='replace').decode('utf-8')
+        file_content = file_content.encode('utf-8', errors='replace').decode('utf-8')
+
+        # Dump the email body to file without encoding parameter
         with open("{}_body.log".format(t_file_prefix), "w") as fp:
             fp.write(msg_content.strip())
 
         if file_content:
-            # Dump full logs into file for attachment
+            # Dump full logs into file for attachment without encoding parameter
             with open("{}.log".format(t_file_prefix), "w") as fp:
                 fp.write(file_content.strip())
 
@@ -723,8 +731,8 @@ class SysTestMon(object):
 
             attachment = "-a \"{0}.zip\"".format(t_file_prefix)
 
-        # Send mail
-        cmd = "mailx -s \"{}\" {} -r \"{}\" \"{}\" < \"{}_body.log\"" \
+        # Send mail with UTF-8 encoding
+        cmd = "LANG=en_US.UTF-8 mailx -s \"{}\" {} -r \"{}\" \"{}\" < \"{}_body.log\"" \
               .format(msg_sub, attachment, mail_from,
                       email_recipients, t_file_prefix)
         self.logger.info("Sending mail: %s" % cmd)
@@ -763,7 +771,6 @@ class SysTestMon(object):
                 neg_stat = None
             self.logger.info(str(stat) + " : " + str(neg_stat))
             msg_content = msg_content + '\n' + str(stat) + " : " + str(neg_stat)
-
         return fin_neg_stat, msg_content
 
     def check_for_negative_stat(self, stat_json):
@@ -1250,6 +1257,45 @@ class SysTestMon(object):
         ssh.close()
         return len(output), output, error
 
+    def get_latest_debug_log_timestamp(self, node):
+        """
+        Fetches the latest timestamp from debug.log file on the given node.
+        Args:
+            node (str): Hostname/IP of the node to check
+        Returns:
+            datetime: Latest timestamp found in debug.log, or None if not found
+        """
+        try:
+            # Command to get last line containing timestamp from debug.log
+            command = "tail -n 1000 /opt/couchbase/var/lib/couchbase/logs/debug.log | grep -E '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' | tail -n 3"
+            _, output, error = self.execute_command(
+                command,
+                node,
+                self.cluster.ssh_username,
+                self.cluster.ssh_password
+            )
+
+            if error:
+                self.logger.error("Error getting debug.log timestamp from {0}: {1}".format(node, error))
+                return None
+
+            if not output:
+                self.logger.warning("No timestamp found in debug.log on {0}".format(node))
+                return None
+
+            # Extract timestamp using regex
+            match = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', output[0])
+            if match:
+                timestamp_str = match.group(1)
+                return datetime.strptime(timestamp_str, '%Y-%m-%dT%H:%M:%S')
+            else:
+                self.logger.warning("Could not parse timestamp from debug.log line on {0}: {1}".format(node, output[0]))
+                return None
+
+        except Exception as e:
+            self.logger.error("Exception getting debug.log timestamp from {0}: {1}".format(node, str(e)))
+            return None
+
 
 def configure_logger():
     # Logging configuration
@@ -1316,7 +1362,6 @@ if __name__ == '__main__':
     ScriptConfig.docker_host = args.docker_host
     ScriptConfig.state_file_dir = args.state_file_dir
     ScriptConfig.scan_xdcr_destination = args.scan_xdcr_destination
-
     Globals.sdk_client = SDKClient(args.cb_host)
 
     # Create cluster object for managing purpose
