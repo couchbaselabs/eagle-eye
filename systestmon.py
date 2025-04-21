@@ -142,7 +142,7 @@ class Configuration(object):
                          "Menelaus-Auth-User:\["],
             "ignore_keywords": ["Fatal:false", "use of closed network connection",
                                 "Reschedule failed, failing request", "TLS handshake error", "cannot unmarshal object",
-                                "bleve.Index is not copyable"],
+                                "bleve.Index is not copyable", "janitor_rollback_pindex"],
             "check_stats_api": True,
             "stats_api_list": ["api/stats"],
             "port": "8094",
