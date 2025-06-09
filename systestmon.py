@@ -107,7 +107,7 @@ class Configuration(object):
                          "Internal error while creating new scan request", "StorageMgr::handleCreateSnapshot Disk commit timestamp is not snapshot aligned",
                          "ReplicaViolation", "ExcludeNodeViolation", "EquivIndexViolation", "ServerGroupViolation", "DeleteNodeViolation",
                          "NoViolation", "MemoryViolation", "NumVbs out of valid range", "Skipped disk snapshot cleanup"],
-            "ignore_keywords": ["fatal remote"],
+            "ignore_keywords": ["fatal remote", "instIdList is zero"],
             "check_stats_api": True,
             "stats_api_list": ["stats", "stats/storage"],
             "port": "9102",
