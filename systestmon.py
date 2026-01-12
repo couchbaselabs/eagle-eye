@@ -589,7 +589,8 @@ class SysTestMon(object):
                     "/opt/couchbase/bin/couchbase-cli collect-logs-start " \
                     "-c {0} -u {1} -p {2} --all-nodes --upload " \
                     "--upload-host cb-jira.s3.us-east-2.amazonaws.com/logs " \
-                    "--customer systestmon-iteration-{3}-{4}"\
+                    "--customer systestmon-iteration-{3}-{4} "\
+                    "--redaction-level partial" \
                     .format(self.cluster.master_node,
                             self.cluster.rest_username,
                             self.cluster.rest_password, self.iter_count, self.token)
