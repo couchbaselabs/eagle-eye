@@ -106,12 +106,26 @@ class Configuration(object):
                          "invalid length of composite element filters in scan request",
                          "Internal error while creating new scan request", "StorageMgr::handleCreateSnapshot Disk commit timestamp is not snapshot aligned",
                          "ReplicaViolation", "ExcludeNodeViolation", "EquivIndexViolation", "ServerGroupViolation", "DeleteNodeViolation",
-                         "NoViolation", "MemoryViolation", "NumVbs out of valid range", "Skipped disk snapshot cleanup"],
+                         "NoViolation", "MemoryViolation", "NumVbs out of valid range", "Skipped disk snapshot cleanup",
+                         "\[Error\] StorageMgr::handleEncryptionDropKey", "\[Error\] bhiveSlice::GetCodebookEncryptionKeyId"],
             "ignore_keywords": ["fatal remote", "instIdList is zero", "NCorruptionErrors"],
             "check_stats_api": True,
             "stats_api_list": ["stats", "stats/storage"],
             "port": "9102",
             "collect_dumps": True
+        },
+        {
+            "component": "index",
+            "logfiles": "info.log*",
+            "services": "all",
+            # Keywords are interpolated into a double quoted zgrep command, so
+            # the quotes around the component name are escaped for the remote
+            # shell. An unescaped " would be stripped and the pattern would
+            # silently match nothing.
+            "keywords": ["Component \\\"index\\\" failed to drop some DEKs"],
+            "ignore_keywords": None,
+            "check_stats_api": False,
+            "collect_dumps": False
         },
         {
             "component": "analytics",
@@ -169,7 +183,6 @@ class Configuration(object):
             "logfiles": "projector.log*",
             "services": "kv",
             "keywords": ["panic", "Error parsing XATTR", "Basic\s[a-zA-Z]\{10,\}", "Menelaus-Auth-User:\[", "seq order violation"],
-            #"keywords": ["panic", "Error parsing XATTR", "Basic\s[a-zA-Z]\{10,\}", "Menelaus-Auth-User:\["],
             "ignore_keywords": None,
             "check_stats_api": False,
             "port": "9999",
