@@ -244,6 +244,7 @@ class ScriptConfig(object):
     should_collect_dumps = False
     cbcollect_on_high_mem_cpu_usage = False
     scan_xdcr_destination = False
+    redaction_level = "none"
 
     docker_host = None
     email_recipients = ""
@@ -589,11 +590,12 @@ class SysTestMon(object):
                     "/opt/couchbase/bin/couchbase-cli collect-logs-start " \
                     "-c {0} -u {1} -p {2} --all-nodes --upload " \
                     "--upload-host cb-jira.s3.us-east-2.amazonaws.com/logs " \
-                    "--customer systestmon-iteration-{3}-{4} "\
-                    "--redaction-level partial" \
+                    "--customer systestmon-iteration-{3}-{4} " \
+                    "--redaction-level {5}" \
                     .format(self.cluster.master_node,
                             self.cluster.rest_username,
-                            self.cluster.rest_password, self.iter_count, self.token)
+                            self.cluster.rest_password, self.iter_count,
+                            self.token, ScriptConfig.redaction_level)
                 _, cbcollect_output, std_err = self.execute_command(
                     command, self.cluster.master_node,
                     self.cluster.ssh_username, self.cluster.ssh_password)
@@ -1336,6 +1338,10 @@ if __name__ == '__main__':
     # Optional args
     parser.add_argument("--cb_host", default="172.23.104.178",
                         help="CB host for SDK connection")
+    parser.add_argument("--redaction_level", choices=["none", "partial"],
+                        default="none",
+                        help="cbcollect_info redaction level. "
+                             "'none' collects plain, non-redacted logs")
 
     # Flags
     parser.add_argument("--cbcollect_on_high_mem_cpu_usage",
@@ -1363,6 +1369,7 @@ if __name__ == '__main__':
     ScriptConfig.docker_host = args.docker_host
     ScriptConfig.state_file_dir = args.state_file_dir
     ScriptConfig.scan_xdcr_destination = args.scan_xdcr_destination
+    ScriptConfig.redaction_level = args.redaction_level
     Globals.sdk_client = SDKClient(args.cb_host)
 
     # Create cluster object for managing purpose
